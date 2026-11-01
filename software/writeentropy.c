@@ -9,7 +9,8 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <linux/random.h>
-#include "libinfnoise.h"
+#include "infnoise.h"
+#include "libinfnoise_private.h"
 
 #define SIZE_PROC_FILENAME "/proc/sys/kernel/random/poolsize"
 #define FILL_PROC_FILENAME "/proc/sys/kernel/random/write_wakeup_threshold"
@@ -17,6 +18,7 @@
 static struct pollfd pfd;
 static uint32_t inmFillWatermark;
 static struct rand_pool_info *inmPoolInfo;
+static uint32_t inmPoolBufLen;
 
 // Find the entropy pool size.
 static uint32_t readNumberFromFile(char *fileName) {
@@ -50,14 +52,28 @@ void inmWriteEntropyStart(uint32_t bufLen, bool debug) {
         fprintf(stderr, "Unable to allocate memory\n");
         exit(1);
     }
+    inmPoolBufLen = bufLen;
     inmFillWatermark = readNumberFromFile(FILL_PROC_FILENAME);
     if(debug) {
-        printf("Entropy pool size:%u, fill watermark:%u\n", readNumberFromFile(SIZE_PROC_FILENAME), inmFillWatermark);
+        fprintf(stderr, "Entropy pool size:%u, fill watermark:%u\n", readNumberFromFile(SIZE_PROC_FILENAME), inmFillWatermark);
     }
 }
 
+// Check that the kernel accepts our entropy, by adding nothing.
+bool inmCanWriteEntropy(void) {
+    inmPoolInfo->entropy_count = 0;
+    inmPoolInfo->buf_size = 0;
+    return ioctl(pfd.fd, RNDADDENTROPY, inmPoolInfo) == 0;
+}
+
 void inmWriteEntropyEnd() {
+    if(inmPoolInfo == NULL) {
+        return;
+    }
+    inmSecureZero(inmPoolInfo, sizeof(struct rand_pool_info) + inmPoolBufLen);
     free( inmPoolInfo );
+    inmPoolInfo = NULL;
+    close(pfd.fd);
 }
 
 // recent Linux kernels seldomly reseed from the input pool (60s),
@@ -73,7 +89,9 @@ void inmForceKernelRngReseed() {
 #endif
 }
 
-// Block until either the entropy pool has room, or 1 minute has passed.
+// Feed the pool at once if it is below the watermark.  Otherwise wait for feed_frequency
+// seconds: once the kernel RNG is ready, /dev/random no longer reports POLLOUT, so this
+// is normally a plain timer.
 void inmWaitForPoolToHaveRoom(uint32_t feed_frequency) {
     int ent_count;
     if (ioctl(pfd.fd, RNDGETENTCNT, &ent_count) == 0 && (uint32_t)ent_count < inmFillWatermark) {
@@ -83,12 +101,19 @@ void inmWaitForPoolToHaveRoom(uint32_t feed_frequency) {
 }
 
 // Add the bytes to the entropy pool.  This can be unwhitenened, but the estimated bits of
-// entropy needs to be accurate or pessimistic.  Return false if the Linux entropy pool is
-// full after writing.
-void inmWriteEntropyToPool(uint8_t *bytes, uint32_t length, uint32_t entropy) {
+// entropy needs to be accurate or pessimistic.  Return false if the kernel refused it.
+bool inmWriteEntropyToPool(uint8_t *bytes, uint32_t length, uint32_t entropy) {
+    if(length > inmPoolBufLen) {
+        errno = EINVAL;
+        return false;
+    }
     inmPoolInfo->entropy_count = entropy;
     inmPoolInfo->buf_size = length;
     memcpy(inmPoolInfo->buf, bytes, length);
     //printf("Writing %u bytes with %u bits of entropy to /dev/random\n", length, entropy);
-    ioctl(pfd.fd, RNDADDENTROPY, inmPoolInfo);
+    int result = ioctl(pfd.fd, RNDADDENTROPY, inmPoolInfo);
+    int savedErrno = errno;
+    inmSecureZero(inmPoolInfo->buf, length);
+    errno = savedErrno;
+    return result == 0;
 }

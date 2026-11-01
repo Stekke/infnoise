@@ -17,16 +17,38 @@
 #include <signal.h>
 #include <time.h>
 #include <getopt.h>
+#include <limits.h>
+#include <errno.h>
 #include "infnoise.h"
-#include "libinfnoise.h"
+#include "libinfnoise_private.h"
 
+// The largest value that fits the 32-bit arithmetic on it
+#define MAX_MULTIPLIER (UINT32_MAX / 32u)
+#define MAX_FEED_FREQ ((uint32_t)(INT_MAX / 1000))
+
+// Tries to get the device working again.  They are forgotten once it has worked for a
+// while, so that a device which keeps failing does end the process.
+#define MAX_RECOVERIES 5u
+#define RECOVERY_DELAY_SECONDS 1u
+#define RECOVERY_FORGET_SECONDS 600
 
 volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t recovering = 0;
 
 void term(int signum)
 {
    (void) signum;
    running = 0;
+   // The warmup can take minutes on a bad device, and there is nothing to save
+   if (recovering) {
+       _exit(0);
+   }
+}
+
+static time_t monotonicSeconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec;
 }
 
 static void initOpts(struct opt_struct *opts) {
@@ -62,6 +84,21 @@ static struct option longopts[] = {
         {"version",      no_argument,       NULL, 'v'},
         {"help",         no_argument,       NULL, 'h'},
         {NULL,           0,                 NULL, 0}};
+
+// Parse a whole decimal number between min and max.
+static bool parseNumber(const char *text, uint32_t min, uint32_t max, uint32_t *value) {
+    char *end;
+    unsigned long number;
+
+    errno = 0;
+    number = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || text[0] == '-'
+        || number < min || number > max) {
+        return false;
+    }
+    *value = (uint32_t)number;
+    return true;
+}
 
 // Write the bytes to either stdout, or /dev/random.
 bool outputBytes(uint8_t *bytes, uint32_t length, uint32_t entropy, bool writeDevRandom, bool forceKernelReseed, uint32_t feedFrequency, const char **message) {
@@ -101,7 +138,10 @@ bool outputBytes(uint8_t *bytes, uint32_t length, uint32_t entropy, bool writeDe
 #endif
 #ifdef LINUX
         inmWaitForPoolToHaveRoom(feedFrequency);
-        inmWriteEntropyToPool(bytes, length, entropy);
+        if (!inmWriteEntropyToPool(bytes, length, entropy)) {
+            *message = "Unable to add entropy to /dev/random";
+            return false;
+        }
         if(forceKernelReseed) {
             inmForceKernelRngReseed();
         }
@@ -137,22 +177,18 @@ int main(int argc, char **argv) {
             case 'n':
                 opts.noOutput = true;
                 break;
-            case 'f': ;
-                int tmpFeedrate = atoi(optarg);
-                if (tmpFeedrate < 0) {
-                    fputs("feed-freq must be >= 0\n", stderr);
+            case 'f':
+                if (!parseNumber(optarg, 0u, MAX_FEED_FREQ, &opts.feedFreq)) {
+                    fprintf(stderr, "feed-freq must be between 0 and %u\n", MAX_FEED_FREQ);
                     return 1;
                 }
-                opts.feedFreq = tmpFeedrate;
                 break;
             case 'm':
                 multiplierAssigned = true;
-                int tmpOutputMult = atoi(optarg);
-                if (tmpOutputMult < 0) {
-                    fputs("Multiplier must be >= 0\n", stderr);
+                if (!parseNumber(optarg, 0u, MAX_MULTIPLIER, &opts.outputMultiplier)) {
+                    fprintf(stderr, "Multiplier must be between 0 and %u\n", MAX_MULTIPLIER);
                     return 1;
                 }
-                opts.outputMultiplier = tmpOutputMult;
                 break;
             case 'p':
                 opts.pidFileName = optarg;
@@ -196,7 +232,7 @@ int main(int argc, char **argv) {
               "    -r, --raw - do not whiten the output\n"
               "    -m, --multiplier <value> - write 256 bits * value for each 512 bits written to\n"
               "      the Keccak sponge.  Default of 0 means write all the entropy.\n"
-              "    -f, --feed-frequency - feed interval for /dev/random, in seconds (default: 30)\n"
+              "    -f, --feed-frequency - feed interval for /dev/random, in seconds, 0 means no wait (default: 30)\n"
               "    -n, --no-output - do not write random output data\n"
               "    -p, --pidfile <file> - write process ID to file\n"
               "    -d, --daemon - run in the background\n"
@@ -218,6 +254,9 @@ int main(int argc, char **argv) {
     // read environment variables, not overriding command line options
     if (opts.serial == NULL) {
         opts.serial = getenv("INFNOISE_SERIAL");
+        if (opts.serial != NULL && opts.serial[0] == '\0') {
+            opts.serial = NULL;
+        }
     }
 
     if (!opts.debug) {
@@ -228,14 +267,12 @@ int main(int argc, char **argv) {
 
     if (!multiplierAssigned) {
         char *envMultiplier = getenv("INFNOISE_MULTIPLIER");
-        if (envMultiplier != NULL) {
-            int tmpOutputMult = atoi(envMultiplier);
-            if (tmpOutputMult < 0) {
-                fputs("Multiplier must be >= 0\n", stderr);
+        if (envMultiplier != NULL && envMultiplier[0] != '\0') {
+            if (!parseNumber(envMultiplier, 0u, MAX_MULTIPLIER, &opts.outputMultiplier)) {
+                fprintf(stderr, "Multiplier must be between 0 and %u\n", MAX_MULTIPLIER);
                 return 1;
             }
             multiplierAssigned = true;
-            opts.outputMultiplier = tmpOutputMult;
         }
     }
 
@@ -252,8 +289,9 @@ int main(int argc, char **argv) {
         infnoise_devlist_node_t* curdev;
         int id = 0;
         for (curdev = devlist; curdev != NULL; id++) {
-            printf("ID: %i, Manufacturer: %s, Description: %s, Serial: %s\n",
-                   id, curdev->manufacturer, curdev->description, curdev->serial);
+            printf("ID: %i, Manufacturer: %s, Description: %s, Serial: %s%s\n",
+                   id, curdev->manufacturer, curdev->description, curdev->serial,
+                   inmIsKnownDescription(curdev->description) ? "" : " (unknown description, needs --serial)");
 
             // cleanup:
             infnoise_devlist_node_t* olddev = curdev;
@@ -265,8 +303,11 @@ int main(int argc, char **argv) {
 
     if (opts.devRandom) {
 #ifdef LINUX
-        inmWriteEntropyStart(BUFLEN / 8u, opts.debug); // TODO: create method in libinfnoise.h for this?
-        // also TODO: check superUser in this mode (it will fail silently if not :-/)
+        inmWriteEntropyStart(INFNOISE_MAX_RESULT, opts.debug); // TODO: create method in libinfnoise.h for this?
+        if (!opts.noOutput && !inmCanWriteEntropy()) {
+            perror("Unable to add entropy to /dev/random, which needs root or CAP_SYS_ADMIN");
+            return 1;
+        }
 #endif
 #if defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__FreeBSD__)
         int devRandomFD = open("/dev/random", O_WRONLY);
@@ -292,6 +333,8 @@ int main(int argc, char **argv) {
         return 1; // ERROR
     }
 
+    daemonReady();
+
     // calculate output size based on the parameters:
     uint64_t resultSize;
     if (opts.outputMultiplier <= 2 || opts.raw) {
@@ -310,24 +353,58 @@ int main(int argc, char **argv) {
 
     // endless loop
     uint64_t totalBytesWritten = 0u;
+    uint32_t recoveries = 0u;
+    time_t lastFailure = 0;
     while (running) {
         uint8_t result[resultSize];
         uint64_t bytesWritten = readData(&context, result, opts.raw, opts.outputMultiplier);
-        totalBytesWritten += bytesWritten;
 
         if (context.errorFlag) {
+            bool recovered = false;
             fprintf(stderr, "Error: %s\n", context.message);
-            return 1;
+            if (monotonicSeconds() - lastFailure >= RECOVERY_FORGET_SECONDS) {
+                recoveries = 0u;
+            }
+            recovering = 1;
+            while (!recovered && running && recoveries < MAX_RECOVERIES) {
+                recoveries++;
+                sleep(RECOVERY_DELAY_SECONDS);
+                recovered = reinitInfnoise(&context);
+                if (!recovered) {
+                    fprintf(stderr, "Error: %s\n", context.message);
+                }
+            }
+            recovering = 0;
+            if (!recovered && running) {
+                fputs("Error: Unable to recover the Infinite Noise Multiplier\n", stderr);
+                return 1;
+            }
+            lastFailure = monotonicSeconds();
+            continue;
         }
+
+        // Nothing passed the checks, so there is nothing to output or credit
+        if (bytesWritten == 0u) {
+            continue;
+        }
+        totalBytesWritten += bytesWritten;
+
+        // Credit a sample's entropy once, and no more than the bytes can hold
+        uint32_t entropy = context.entropyThisTime;
+        if (entropy > bytesWritten * 8u) {
+            entropy = bytesWritten * 8u;
+        }
+        context.entropyThisTime = 0u;
 
         if (!opts.noOutput
-            && !outputBytes(result, bytesWritten, context.entropyThisTime, opts.devRandom, opts.forceReseed, opts.feedFreq, &context.message)) {
+            && !outputBytes(result, bytesWritten, entropy, opts.devRandom, opts.forceReseed, opts.feedFreq, &context.message)) {
             fprintf(stderr, "Error: %s\n", context.message);
             return 1;
         }
+        inmSecureZero(result, sizeof(result));
 
         if (opts.debug &&
-            (1u << 20u) * (totalBytesWritten / (1u << 20u)) > (1u << 20u) * (totalBytesWritten + bytesWritten / (1u << 20u))) {
+            totalBytesWritten / (1u << 20u) != (totalBytesWritten - bytesWritten) / (1u << 20u)) {
             fprintf(stderr, "Output %lu bytes\n", (unsigned long) totalBytesWritten);
         }
     }

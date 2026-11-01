@@ -56,8 +56,8 @@ load 'test_helper/bats-assert/load'
   echo $output
   [ "$status" -eq 124 ]
 
-  assert_line --index 0 --regexp '^Generated 1048576 bits.  OK to use data.  Estimated entropy per bit: 0\.[0-8][6-8][0-9]+, estimated K: 1\.8[1-5][0-9]+$'
-  assert_line --index 1 --regexp '^num1s:50.[0-9]+%, even misfires:0.[0-1][0-9]+%, odd misfires:0.[0-1][0-9]+%$'
+  assert_line --regexp '^Generated 1048576 bits.  OK to use data.  Estimated entropy per bit: 0\.[0-8][6-8][0-9]+, estimated K: 1\.8[1-5][0-9]+$'
+  assert_line --regexp '^num1s:50.[0-9]+%, even misfires:0.[0-1][0-9]+%, odd misfires:0.[0-1][0-9]+%$'
 }
 
 @test "test --list-devices" {
@@ -66,10 +66,10 @@ load 'test_helper/bats-assert/load'
   [ "$status" -eq 0 ]
 
   # FTDI serial:
-  assert_line --index 1 --regexp '^Manufacturer: FTDI, Description: FT240X USB FIFO, Serial: [0-9A-Z]+$'
+  assert_line --index 1 --regexp '^ID: [0-9]+, Manufacturer: FTDI, Description: FT240X USB FIFO, Serial: [0-9A-Z]+$'
 
   # 13-37.org serial:
-  assert_line --index 0 --regexp '^Manufacturer: 13-37.org, Description: Infinite Noise TRNG, Serial: [0-9A-F]+$'
+  assert_line --index 0 --regexp '^ID: [0-9]+, Manufacturer: 13-37.org, Description: Infinite Noise TRNG, Serial: [0-9A-F]+$'
 }
 
 @test "test --serial with not connected serial (results in error)" {

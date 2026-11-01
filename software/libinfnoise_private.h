@@ -25,6 +25,22 @@
 // delays can reduce entropy from the INM.
 #define MAX_MICROSEC_FOR_SAMPLES 5000u
 
+// How often a failed USB transfer is tried, before readData() reports an error
+#define USB_MAX_ATTEMPTS 3u
+
+// How long a read can keep getting status-only packets
+#define USB_READ_DEADLINE_MICROSEC 100000u
+
+// Limits the reads while discarding samples, if the device keeps sending them
+#define USB_MAX_DRAIN_READS 16u
+
+// readData() reports an error after this many samples in a row were thrown away
+#define MAX_REJECTED_SAMPLES 5000u
+
+// Warmup gives up after this many reads, or this many failed health checks
+#define MAX_WARMUP_ROUNDS 5000u
+#define MAX_WARMUP_HEALTH_FAULTS 10u
+
 // This is the gain of each of the two op-amp stages in the INM
 #define DESIGN_K 1.84
 
@@ -46,6 +62,7 @@
 #define MASK (0xffu & ~(1u << COMP1) & ~(1u << COMP2))
 
 bool inmHealthCheckStart(uint8_t N, double K, bool debug);
+void inmHealthCheckRestart(void);
 void inmHealthCheckStop(void);
 bool inmHealthCheckAddBit(bool evenBit, bool oddBit, bool even);
 bool inmHealthCheckOkToUseData(void);
@@ -67,6 +84,7 @@ struct timespec;
 double diffTime(struct timespec *start, struct timespec *end);
 uint32_t extractBytes(uint8_t *bytes, uint32_t length, uint8_t *inBuf, const char **message, bool *errorFlag);
 
-bool outputBytes(uint8_t *bytes, uint32_t length, uint32_t entropy, bool writeDevRandom, const char **message);
+void inmSecureZero(void *buf, size_t length);
+bool inmIsKnownDescription(const char *description);
 
 #endif

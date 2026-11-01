@@ -12,6 +12,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
 
 #pragma warning(push)  // Suppress -W4 `warning C4214:  nonstandard extension used: bit field types other than int` in ftd2xx.h::_FTDCB
 #pragma warning(disable : 4214)
@@ -77,7 +78,7 @@ static uint32_t extractBytes(uint8_t *bytes, uint8_t *inBuf, bool raw) {
             uint8_t evenBit = (val >> COMP2) & 1;
             uint8_t oddBit = (val >> COMP1) & 1;
             bool even = j & 1; // Use the even bit if j is odd
-            uint8_t bit = even? oddBit : evenBit;
+            uint8_t bit = even? evenBit : oddBit;
             byte = (byte << 1) | bit;
             // This is a good place to feed the bit from the INM to the health checker.
 			uint8_t addr = extractAddress(val);
@@ -150,16 +151,32 @@ static void processBytes(FILE* outFile, uint8_t *keccakState, uint8_t *bytes, ui
     }
 }
 
-// Initialize the Infinite Noise Multiplier USB ineterface.
-static bool initializeUSB(FT_HANDLE *ftdic, char **message) {
-    *message = NULL;
+// Read exactly length bytes.
+static bool readFully(FT_HANDLE ftdic, uint8_t *buf, DWORD length) {
+    DWORD total = 0;
+    while(total < length) {
+        DWORD numBytes;
+        if(FT_Read(ftdic, buf + total, length - total, &numBytes) != FT_OK || numBytes == 0) {
+            return false;
+        }
+        total += numBytes;
+    }
+    return true;
+}
 
-    // Open FTDI device based on FT240X vendor & product IDs
-	if (FT_Open(0, ftdic) != FT_OK) {
-		*message = "Can't find Infinite Noise Multiplier\n";
-		return false;
-	}
+// Open the device with this serial, or if serial is NULL, the first with the USB
+// description of an INM.  Other FTDI products must be left alone.
+static bool openDevice(FT_HANDLE *ftdic, char *serial) {
+    if(serial != NULL) {
+        return FT_OpenEx(serial, FT_OPEN_BY_SERIAL_NUMBER, ftdic) == FT_OK;
+    }
+    return FT_OpenEx("Infinite Noise TRNG", FT_OPEN_BY_DESCRIPTION, ftdic) == FT_OK
+        || FT_OpenEx("FT240X USB FIFO", FT_OPEN_BY_DESCRIPTION, ftdic) == FT_OK
+        || FT_OpenEx("FT240X", FT_OPEN_BY_DESCRIPTION, ftdic) == FT_OK;
+}
 
+// Configure the open device and test it.
+static bool setupDevice(FT_HANDLE *ftdic, char **message) {
     // Set high baud rate
 	if (FT_SetBaudRate(*ftdic, 30000) != FT_OK) {
         *message = "Setting baud rate failed\n";
@@ -179,22 +196,27 @@ static bool initializeUSB(FT_HANDLE *ftdic, char **message) {
         *message = "USB write failed\n";
         return false;
     }
-	DWORD bytesRead;
-    if(FT_Read(*ftdic, buf, 64, &bytesRead) != FT_OK || bytesRead != 64) {
+    if(!readFully(*ftdic, buf, 64)) {
         *message = "USB read failed\n";
         return false;
     }
     return true;
 }
 
-/*
-// Return the difference in the times as a double in microseconds.
-static double diffTime(struct timespec *start, struct timespec *end) {
-    uint32_t seconds = end->tv_sec - start->tv_sec;
-    int32_t nanoseconds = end->tv_nsec - start->tv_nsec;
-    return seconds*1e6 + nanoseconds/1000.0;
+// Initialize the Infinite Noise Multiplier USB ineterface.  On failure nothing is left
+// open, since an open handle would keep the device busy for the next attempt.
+static bool initializeUSB(FT_HANDLE *ftdic, char *serial, char **message) {
+    *message = NULL;
+    if(!openDevice(ftdic, serial)) {
+        *message = "Can't find Infinite Noise Multiplier. Use --serial if its USB description was changed.\n";
+        return false;
+    }
+    if(!setupDevice(ftdic, message)) {
+        FT_Close(*ftdic);
+        return false;
+    }
+    return true;
 }
-*/
 
 int main(int argc, char **argv)
 {
@@ -204,6 +226,7 @@ int main(int argc, char **argv)
     bool writeDevRandom = false;
     bool noOutput = false;
 	char* outFileName = NULL;
+    char *serial = NULL;
     uint32_t outputMultiplier = 2;
     int xArg;
 
@@ -224,6 +247,9 @@ int main(int argc, char **argv)
                 fputs("Multiplier must be > 0\n", stderr);
                 return 1;
             }
+        } else if(!strcmp(argv[xArg], "--serial") && xArg+1 < argc) {
+            xArg++;
+            serial = argv[xArg];
 		} else if(!strcmp(argv[xArg], "--help") || !strcmp(argv[xArg], "--?") || xArg < argc-1) {
 			// Got a help option or something unexpected that's not the final arg
             fputs(
@@ -234,7 +260,8 @@ int main(int argc, char **argv)
                 "    --raw - do not whiten the output\n"
                 "    --multiplier <value> - write 256 bits * value for each 512 bits written to\n"
                 "      the Keccak sponge\n"
-                "    --no-output - do not write random output data\n", stderr);
+                "    --no-output - do not write random output data\n"
+                "    --serial <serial> - use specified device\n", stderr);
             return 1;
         }
 		else {
@@ -247,7 +274,7 @@ int main(int argc, char **argv)
 	if (outFileName) {
 		outFile = _fsopen(outFileName, "wb", _SH_DENYWR);
 		if (!outFile) {
-			fprintf(stderr, "Unable to open file %s\n", argv[xArg]);
+			fprintf(stderr, "Unable to open file %s\n", outFileName);
 			return 1;
 		}
 	} else {
@@ -270,13 +297,13 @@ int main(int argc, char **argv)
         return 1;
     }
     uint8_t keccakState[KeccakPermutationSizeInBytes];
+    KeccakInitialize();
     KeccakInitializeState(keccakState);
 
     char *message;
-    if(!initializeUSB(&ftdic, &message)) {
+    if(!initializeUSB(&ftdic, serial, &message)) {
         // Sometimes have to do it twice - not sure why
-        //ftdi_usb_close(&ftdic);
-        if(!initializeUSB(&ftdic, &message)) {
+        if(!initializeUSB(&ftdic, serial, &message)) {
             fputs(message, stderr);
             return 1;
         }
@@ -291,44 +318,42 @@ int main(int argc, char **argv)
         outBuf[i] |= makeAddress(i & 0xf);
     }
 
-	uint64_t good = 0;
-/*
-    uint64_t bad = 0;
-*/
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    uint32_t rejectedSamples = 0;
     while(true) {
-/*
-        struct timespec start;
-        clock_gettime(CLOCK_REALTIME, &start);
-*/
+        LARGE_INTEGER start;
+        QueryPerformanceCounter(&start);
 		DWORD numBytes;
         if(FT_Write(ftdic, outBuf, BUFLEN, &numBytes) != FT_OK || numBytes != BUFLEN) {
             fputs("USB write failed\n", stderr);
             return -1;
         }
-        if(FT_Read(ftdic, inBuf, BUFLEN, &numBytes) != FT_OK || numBytes != BUFLEN) {
+        if(!readFully(ftdic, inBuf, BUFLEN)) {
             fputs("USB read failed\n", stderr);
             return -1;
         }
-/*
-        struct timespec end;
-        clock_gettime(CLOCK_REALTIME, &end);
-        uint32_t us = diffTime(&start, &end);
-        //printf("diffTime:%u us\n", us);
-*/
-//        if(us <= MAX_MICROSEC_FOR_SAMPLES) {
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        double us = (double)(end.QuadPart - start.QuadPart)*1e6/frequency.QuadPart;
+        bool accepted = false;
+        if(us <= MAX_MICROSEC_FOR_SAMPLES) {
             uint8_t bytes[BUFLEN/8];
             uint32_t entropy = extractBytes(bytes, inBuf, raw);
-            if(!noOutput && inmHealthCheckOkToUseData() && inmEntropyOnTarget(entropy, BUFLEN)) {
-                processBytes(outFile, keccakState, bytes, entropy, raw, writeDevRandom, outputMultiplier);
+            if(inmHealthCheckOkToUseData() && inmEntropyOnTarget(entropy, BUFLEN)) {
+                accepted = true;
+                if(!noOutput) {
+                    processBytes(outFile, keccakState, bytes, entropy, raw, writeDevRandom, outputMultiplier);
+                }
             }
-            good++;
-  /*      } else {
-            bad++;
         }
-*/
-        //if(((good + bad) & 0xff) == 0) {
-            //printf("Good %lu, bad %lu\n", good, bad);
-        //}
+        // A few rejected samples are normal, but don't keep trying without telling anyone
+        if(accepted) {
+            rejectedSamples = 0;
+        } else if(++rejectedSamples >= MAX_REJECTED_SAMPLES) {
+            fputs("Too many samples rejected: USB transfers are too slow, or entropy is out of range\n", stderr);
+            return -1;
+        }
 			fflush(stdout);
 			fflush(stderr);
     }

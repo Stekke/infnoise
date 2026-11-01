@@ -23,6 +23,7 @@ confirmed.
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include <time.h>
 #include "libinfnoise_private.h"
 
@@ -62,18 +63,14 @@ void inmDumpStats(void) {
 
 // Free memory used by the health check.
 void inmHealthCheckStop(void) {
-    if(inmOnesEven != NULL) {
-        free(inmOnesEven);
-    }
-    if(inmZerosEven != NULL) {
-        free(inmZerosEven);
-    }
-    if(inmOnesOdd != NULL) {
-        free(inmOnesOdd);
-    }
-    if(inmZerosOdd != NULL) {
-        free(inmZerosOdd);
-    }
+    free(inmOnesEven);
+    free(inmZerosEven);
+    free(inmOnesOdd);
+    free(inmZerosOdd);
+    inmOnesEven = NULL;
+    inmZerosEven = NULL;
+    inmOnesOdd = NULL;
+    inmZerosOdd = NULL;
 }
 
 // Reset the statistics.
@@ -88,6 +85,28 @@ static void resetStats(void) {
     inmOddMisfires = 0u;
 }
 
+// Reset everything measured so far.
+static void resetState(void) {
+    inmPrevBits = 0u;
+    inmTotalBits = 0u;
+    inmPrevBit = false;
+    inmPrevEven = false;
+    inmPrevOdd = false;
+    inmNumSequentialZeros = 0u;
+    inmNumSequentialOnes = 0u;
+    resetStats();
+}
+
+// Forget all data, so that inmHealthCheckOkToUseData() is false until there is enough new data.
+void inmHealthCheckRestart(void) {
+    size_t tableSize = ((size_t)1u << inmN) * sizeof(*inmOnesEven);
+    memset(inmOnesEven, 0, tableSize);
+    memset(inmZerosEven, 0, tableSize);
+    memset(inmOnesOdd, 0, tableSize);
+    memset(inmZerosOdd, 0, tableSize);
+    resetState();
+}
+
 // Initialize the health check.  N is the number of bits used to predict the next bit.
 // At least 8 bits must be used, and no more than 30.  In general, we should use bits
 // large enough so that INM output will be uncorrelated with bits N samples back in time.
@@ -96,21 +115,14 @@ bool inmHealthCheckStart(uint8_t N, double K, bool debug) {
         return false;
     }
     inmDebug = debug;
-    inmNumBitsOfEntropy = 0u;
-    inmCurrentProbability = 1.0;
     inmK = K;
     inmN = N;
-    inmPrevBits = 0u;
     inmOnesEven = calloc((size_t)1u << N, sizeof(*inmOnesEven));
     inmZerosEven = calloc((size_t)1u << N, sizeof(*inmZerosEven));
     inmOnesOdd = calloc((size_t)1u << N, sizeof(*inmOnesOdd));
     inmZerosOdd = calloc((size_t)1u << N, sizeof(*inmZerosOdd));
     inmExpectedEntropyPerBit = log(K)/log(2.0);
-    inmTotalBits = 0u;
-    inmPrevBit = false;
-    inmNumSequentialZeros = 0u;
-    inmNumSequentialOnes = 0u;
-    resetStats();
+    resetState();
     if(inmOnesEven == NULL || inmZerosEven == NULL || inmOnesOdd == NULL || inmZerosOdd == NULL) {
         inmHealthCheckStop();
         return false;

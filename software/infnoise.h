@@ -27,9 +27,11 @@ struct opt_struct {
 
 
 void inmWriteEntropyStart(uint32_t bufLen, bool debug);
+bool inmCanWriteEntropy(void);
 void inmWriteEntropyEnd();
-void inmWriteEntropyToPool(uint8_t *bytes, uint32_t length, uint32_t entropy);
+bool inmWriteEntropyToPool(uint8_t *bytes, uint32_t length, uint32_t entropy);
 void inmForceKernelRngReseed();
 void inmWaitForPoolToHaveRoom(uint32_t feedFreq);
 
 void startDaemon(struct opt_struct *opts);
+void daemonReady(void);

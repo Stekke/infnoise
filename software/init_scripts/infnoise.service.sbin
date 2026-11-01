@@ -11,6 +11,7 @@ ExecStart=/usr/sbin/infnoise --dev-random --daemon --pidfile /var/run/infnoise.p
 User=root
 Group=root
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

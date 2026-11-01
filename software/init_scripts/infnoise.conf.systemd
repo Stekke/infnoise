@@ -1,7 +1,7 @@
 # systemd configuration file for the Infinite Noise TRNG
 
 #INFNOISE_MULTIPLIER=10
-# keccak multiplier, default = 1
+# keccak multiplier, default = 2 with --dev-random, otherwise 0 (output all the entropy)
 
 #INFNOISE_SERIAL=DO0032ZA
 # serial number of device, default: ""

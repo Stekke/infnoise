@@ -8,8 +8,11 @@ int main() {
         value = getchar();
         if(++count == 64) {
             putchar('\n');
+            count = 0;
         }
     }
-    putchar('\n');
+    if(count != 0) {
+        putchar('\n');
+    }
     return 0;
 }

@@ -15,6 +15,9 @@
 // We also write this in one go to the Keccak sponge, which is at most 1600 bits
 #define BUFLEN 512u
 
+// The most bytes one call of readData() can output
+#define INFNOISE_MAX_RESULT 128u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,7 +43,8 @@ struct _infnoise_devlist_node_t {
 };
 
 /*
- * returns a struct of infnoise_devlist_node listing all connected FTDI FT240 devices by their USB descriptors
+ * returns a struct of infnoise_devlist_node listing all connected FTDI FT-X devices by their USB descriptors
+ * Devices that can't be read, for example because of missing permissions, are left out.
  *
  * parameters:
  *  - message: pointer for error message
@@ -51,15 +55,26 @@ infnoise_devlist_node_t* listUSBDevices(const char **message);
 
 /*
  * initialize the Infinite Noise TRNG - must be called once before readData() works
+ * A process can use only one device at a time.
  *
  * parameters:
  *  - context: pointer to infnoise_context struct
- *  - serial: optional serial number of the device (NULL)
+ *  - serial: optional serial number of the device (NULL), must stay valid until deinitInfnoise()
  *  - keccak: initialize Keccak sponge (required to use readData with raw=false)
  *  - debug: debug flag
- * returns: boolean success indicator (0=success)
+ * returns: true on success, otherwise the reason is in context->message
 */
 bool initInfnoise(struct infnoise_context *context, char *serial, bool keccak, bool debug);
+
+/*
+ * reopen the device and repeat the health check warmup after readData() set errorFlag.
+ * The Keccak sponge keeps its state.
+ *
+ * parameters:
+ *  - context: pointer to infnoise_context struct passed to initInfnoise()
+ * returns: true on success, otherwise the reason is in context->message
+*/
+bool reinitInfnoise(struct infnoise_context *context);
 
 
 /*
@@ -79,6 +94,9 @@ void deinitInfnoise(struct infnoise_context *context);
  * and the data from this call has to be discarded when it returns true!
  *
  * Detailed error messages can then be found in context->message.
+ *
+ * It is normal that this returns 0 bytes without an error at times, when a sample did
+ * not pass the checks.  If 5000 samples in a row don't pass, errorFlag is set.
  *
  * parameters:
  *  - context: infnoise_context struct with device pointer and state variables

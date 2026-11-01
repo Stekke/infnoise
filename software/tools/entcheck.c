@@ -176,7 +176,7 @@ static void usage(void) {
            "    -N numBits    -- Use N previous bits to predict the next bit\n"
            "    -s numStreams -- Use s streams to predict the next bit\n"
            "\n"
-           "entcheck simply uses the previous N bits (16 by default) to predict the next bit.\n"
+           "entcheck simply uses the previous N bits (12 by default) to predict the next bit.\n"
            "It estimates the entropy based on 'surprise', or log2 of the probability of seeing\n"
            "the string of 0's and 1's.  Sometimes some bits are special, such as the output of\n"
            "an 8 bit DAC, where we want different tables depending on which bit we're predicting.\n"
@@ -185,8 +185,8 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    uint8_t N = 12u;
-    uint8_t numStreams = 2u;
+    int N = 12;
+    int numStreams = 2;
     int xArg;
     for(xArg = 1u; xArg < argc; xArg++) {
         if(!strcmp(argv[xArg], "-N")) {
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
                 usage();
             }
             N = atoi(argv[xArg]);
-            if(N == 0u) {
+            if(N < 1 || N > 30) {
                 usage();
             }
         } else if(!strcmp(argv[xArg], "-s")) {
@@ -204,7 +204,7 @@ int main(int argc, char **argv) {
                 usage();
             }
             numStreams = atoi(argv[xArg]);
-            if(numStreams == 0u || numStreams > 32u) {
+            if(numStreams < 1 || numStreams > 32) {
                 usage();
             }
         } else {

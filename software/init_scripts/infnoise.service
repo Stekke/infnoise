@@ -6,10 +6,12 @@ After=dev-infnoise.device
 [Service]
 Type=forking
 WorkingDirectory=/tmp
+EnvironmentFile=-/etc/infnoise.conf
 ExecStart=/usr/local/sbin/infnoise --dev-random --daemon --pidfile /var/run/infnoise.pid
 User=root
 Group=root
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

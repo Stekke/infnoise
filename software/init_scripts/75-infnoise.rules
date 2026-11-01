@@ -1,2 +1,4 @@
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", SYMLINK+="infnoise", GROUP="dialout", MODE="0664"
-ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", ENV{SYSTEMD_WANTS}="infnoise.service"
+# Other FTDI products share this USB ID, so only known USB descriptions are matched.  For a
+# device with another description, see "Udev rules" in README.md.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ATTRS{product}=="Infinite Noise TRNG|FT240X USB FIFO|FT240X", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", SYMLINK+="infnoise", GROUP="dialout", MODE="0664"
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ATTRS{product}=="Infinite Noise TRNG|FT240X USB FIFO|FT240X", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", ENV{SYSTEMD_WANTS}="infnoise.service"

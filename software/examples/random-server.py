@@ -1,9 +1,9 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
+import queue
 import shlex
 import subprocess
 from threading import Thread
-import time
 import web
 
 urls = (
@@ -18,6 +18,9 @@ RESPONSE_SIZE=8192
 MIN_POOL_SIZE=1  # in MB
 MAX_POOL_SIZE=32 # in MB
 
+# There is no TLS, so anybody on the network path could read the random data
+LISTEN_ADDRESS=("127.0.0.1", 8080)
+
 class help:
     def GET(self):
         message= "<html><head>"
@@ -29,7 +32,7 @@ class help:
 #        print "<td><tr>/reg</tr><tr>todo</tr></td>"
         message+= "</table>"
         message+= "</body></html>"
-	return message
+        return message
 
 class GetRandomData:
     def GET(self):
@@ -40,55 +43,48 @@ class GetPoolStatus:
         return POOL.getStatus()
 
 class RandPool(object):
-    minPoolSize = (MIN_POOL_SIZE * 1024 * 1024) / RESPONSE_SIZE
-    maxPoolSize = (MAX_POOL_SIZE * 1024 * 1024) / RESPONSE_SIZE
-    poolFillmark = -1
-    randomPool = list()
-    process = None
-    do_run = True
+    minPoolSize = (MIN_POOL_SIZE * 1024 * 1024) // RESPONSE_SIZE
+    maxPoolSize = (MAX_POOL_SIZE * 1024 * 1024) // RESPONSE_SIZE
 
     def __init__(self):
+        # The queue makes sure that every block is handed out once, also to parallel requests
+        self.randomPool = queue.Queue(self.maxPoolSize)
         command = "sudo /usr/sbin/infnoise --multiplier 10"
         self.process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE)
         for i in range(0, self.minPoolSize):
-            self.randomPool.append(self.process.stdout.read(RESPONSE_SIZE))
-            self.poolFillmark+= 1
-        thread2 = Thread(target=self.monitorPool)
+            self.__read_block__()
+        thread2 = Thread(target=self.monitorPool, daemon=True)
         thread2.start()
 
-    def monitorPool(self):
-        while getattr(self, "do_run", True):
-            if self.poolFillmark < self.maxPoolSize: # keep pool at 100%
-                print(str(self.poolFillmark)+ "/" + str(self.maxPoolSize))
-                self.__refill_pool__()
-            time.sleep(1)
-        print("Stopping as you wish.")
-        self.process.kill()
+    def __read_block__(self):
+        data = self.process.stdout.read(RESPONSE_SIZE)
+        if len(data) < RESPONSE_SIZE:
+            return False
+        self.randomPool.put(data) # waits while the pool is at 100%
+        return True
 
-    def __refill_pool__(self):
-        print("refilling pool - current level: " + str(self.poolFillmark))
-        for i in range(self.poolFillmark, self.maxPoolSize):
-            self.randomPool.append(self.process.stdout.read(RESPONSE_SIZE))
-            self.poolFillmark += 1
-        self.randomPool.reverse()
-        print("refilled pool - new level: " + str(self.poolFillmark))
+    def monitorPool(self):
+        while self.__read_block__():
+            pass
+        print("infnoise stopped")
 
     def getData(self):
-        if self.poolFillmark <= 0:
+        try:
+            return self.randomPool.get_nowait()
+        except queue.Empty:
             web.ctx.status = '503 Service currently unavailable - Out of entropy error'
             return "0"
-        value = self.randomPool[self.poolFillmark]
-        self.randomPool[self.poolFillmark] = None
-        self.poolFillmark -= 1
-        return value
 
     def getStatus(self):
-        return str(self.poolFillmark) + "/" + str(self.maxPoolSize)
+        return str(self.randomPool.qsize()) + "/" + str(self.maxPoolSize)
+
+    def stop(self):
+        print("Stopping as you wish.")
+        self.process.kill()
 
 POOL = RandPool()
 
 if __name__ == '__main__':
     app = web.application(urls, globals())
-    app.run()
-    POOL.do_run = False
-
+    web.httpserver.runsimple(app.wsgifunc(), LISTEN_ADDRESS)
+    POOL.stop()

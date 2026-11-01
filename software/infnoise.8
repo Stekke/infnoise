@@ -48,7 +48,8 @@ typically used with \-\-no\-output as a sanity test.
 .TP
 .B \-\-dev\-random
 adds the filtered data to the system's entropy pool instead of sending
-it to its standard output.
+it to its standard output. On Linux this needs root or the CAP_SYS_ADMIN
+capability, and the program exits with an error without it.
 .TP
 .B \-\-raw
 disables output whitening.
@@ -72,3 +73,6 @@ starts the program as a daemon.
 .BR \-\-serial <\fIserial\fP>
 uses the device matching the specified
 .IR serial .
+Without this option, only devices with the USB description
+"Infinite Noise TRNG", "FT240X USB FIFO" or "FT240X" are used, since other FTDI
+products share the same USB ID.

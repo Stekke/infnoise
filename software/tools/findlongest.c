@@ -8,9 +8,23 @@
 
 #define MAX_STRING_SIZE 34u
 
+// Allocate cleared memory, or exit.
+static void *allocateCleared(uint64_t size) {
+    void *data = calloc(size, 1u);
+    if(data == NULL) {
+        fprintf(stderr, "Unable to allocate memory\n");
+        exit(1);
+    }
+    return data;
+}
+
+static bool *allocateBits(uint64_t size) {
+    return allocateCleared(size*sizeof(bool));
+}
+
 // Generate random data for use in testing.
 static bool *generateRandomData(uint32_t size) {
-    bool *data = calloc(size, sizeof(bool));
+    bool *data = allocateBits(size);
     srand(time(NULL));
     uint32_t i;
     for(i = 0u; i < size; ) {
@@ -36,12 +50,18 @@ static bool *readDataFromFile(char *fileName, uint64_t *length) {
     }
     uint64_t pos = 0u;
     uint64_t size = 16384u;
-    bool *data = calloc(size, sizeof(bool));
+    bool *data = allocateBits(size);
     int c = getc(file);
     while(c != EOF) {
         if(pos*8u + 8u >= size) {
+            data = realloc(data, size << 1u);
+            if(data == NULL) {
+                fprintf(stderr, "Unable to allocate memory\n");
+                exit(1);
+            }
+            // Only true is ever written, so the new part has to be false
+            memset(data + size, 0, size);
             size <<= 1u;
-            data = realloc(data, size);
         }
         uint8_t v = c;
         uint32_t i;
@@ -61,17 +81,17 @@ static bool *readDataFromFile(char *fileName, uint64_t *length) {
 }
 
 // Find out if the string has a repeated sub-string of the given length.
-static bool hasSubstringOfLength(uint32_t substringLen, bool *data, uint32_t dataLen, uint8_t *stringsSeen) {
-    memset(stringsSeen, 0, 1u << (substringLen-3));
+static bool hasSubstringOfLength(uint32_t substringLen, bool *data, uint64_t dataLen, uint8_t *stringsSeen) {
+    memset(stringsSeen, 0, (uint64_t)1u << (substringLen-3u));
     uint64_t value = 0u;
-    uint32_t i;
+    uint64_t i;
     for(i = 0u; i < substringLen; i++) {
         value = (value << 1u) | data[i];
     }
     for(i = substringLen; i < dataLen; i++) {
         if(stringsSeen[value >> 3u] & (1u << (value & 0x7u))) {
-            printf("Found duplicate substring of length %u at %u(%x.%u): %llx\n", substringLen,
-                i, i >> 3u, i & 0x7u, (long long)value);
+            printf("Found duplicate substring of length %u at %llu(%llx.%u): %llx\n", substringLen,
+                (unsigned long long)i, (unsigned long long)(i >> 3u), (uint32_t)(i & 0x7u), (long long)value);
             return true;
         }
         stringsSeen[value >> 3u] |= 1u << (value & 0x7u);
@@ -98,7 +118,8 @@ int main(int argc, char **argv) {
     } else {
         data = readDataFromFile(argv[1], &dataLen);
     }
-    uint8_t *stringsSeen = calloc((uint64_t)1 << (MAX_STRING_SIZE-4u), sizeof(uint8_t));
+    // One bit for each possible string of the longest length
+    uint8_t *stringsSeen = allocateCleared((uint64_t)1 << (MAX_STRING_SIZE-3u));
     uint32_t len;
     for(len = 4u; len <= MAX_STRING_SIZE; len++) {
         if(!hasSubstringOfLength(len, data, dataLen, stringsSeen)) {

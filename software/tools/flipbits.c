@@ -12,7 +12,7 @@ static uint8_t currentOutByte = 0u;
 static uint64_t readVal(uint8_t width, bool *endOfInput) {
     *endOfInput = false;
     uint64_t value = 0u;
-    uint8_t mask = 1u << (availableInBits-1u);
+    uint8_t mask = availableInBits == 0u? 0u : 1u << (availableInBits-1u);
     while(width--) {
         value <<= 1u;
         if(availableInBits == 0u) {
@@ -49,11 +49,11 @@ static void writeValReverse(uint64_t value, uint8_t width) {
 }
 
 int main(int argc, char **argv) {
-    uint8_t width = 8u;
+    int width = 8;
     if(argc == 2) {
         width = atoi(argv[1]);
     }
-    if(width == 0u || width > 64u || argc > 2) {
+    if(width < 1 || width > 64 || argc > 2) {
         fprintf(stderr, "Usage: flipbits [width]\n");
         return 1;
     }

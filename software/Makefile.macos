@@ -24,7 +24,7 @@ all: libinfnoise.a libinfnoise.so infnoise tools.stamp
 infnoise: libinfnoise.a infnoise.o daemon.o
 	$(CC) $(CFLAGS) -o infnoise infnoise.o daemon.o libinfnoise.a $(FTDI) -lm -L. -L $(FTDILOCL)
 
-%.o: %.c infnoise.h libinfnoise.h
+%.o: %.c infnoise.h libinfnoise.h libinfnoise_private.h
 	$(CC) -c -o $@ $< $(CFLAGS)
 
 KeccakF-1600-reference.o: Keccak/KeccakF-1600-reference.c Keccak/KeccakF-1600-interface.h Keccak/brg_endian.h

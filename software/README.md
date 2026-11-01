@@ -136,7 +136,13 @@ Usage
         -h, --help - this help output
 
 Note: The options --daemon, --dev-random and --pidfile are only implemented in the GNU/Linux version. 
-The windows version is also lacking --list-devices and --serial. 
+The windows version is also lacking --list-devices. 
+
+On Linux, `--dev-random` needs root or the `CAP_SYS_ADMIN` capability, and `infnoise` exits with an error without it. A systemd service that runs as another user needs `AmbientCapabilities=CAP_SYS_ADMIN`.
+
+Other FTDI products share the USB ID of the Infinite Noise TRNG, so without `--serial`, `infnoise` only uses devices with the USB description "Infinite Noise TRNG", "FT240X USB FIFO" or "FT240X". `--list-devices` lists every FTDI FT-X device it can read, and marks the ones that need `--serial`.
+
+If the device stops working, for example after system sleep, or the health check fails, `infnoise` reopens the device and repeats the warmup. It does the same if 5000 samples in a row are rejected, for example because USB transfers are too slow. It exits with an error after 5 tries, unless the device then worked for 10 minutes.
 
 Examples
 --------
@@ -261,6 +267,11 @@ It relies on the systemd service "infnoise.service" provided under init_scripts,
     ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", ENV{SYSTEMD_WANTS}="infnoise.service"
 
 This also adds a symlink so the device removal can also be reacted on.
+
+The rule shipped in init_scripts/75-infnoise.rules only matches the USB descriptions "Infinite Noise TRNG", "FT240X USB FIFO" and "FT240X", since other FTDI products share this USB ID. A device with another description gets no symlink, no permissions and no service start, even with `INFNOISE_SERIAL` set. For such a device, add your own rules that match its serial, which `infnoise --list-devices` shows:
+
+    SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ATTRS{serial}=="YOURSERIAL", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", SYMLINK+="infnoise", GROUP="dialout", MODE="0664"
+    ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ATTRS{serial}=="YOURSERIAL", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", TAG+="systemd", ENV{SYSTEMD_WANTS}="infnoise.service"
 
 I personally run the infnoise tool by hand from a bash shell, typically to test devices like this:
 
