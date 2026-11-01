@@ -18,10 +18,8 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
 #include "infnoise.h"
-
-/* Module parameter reference */
-extern bool infnoise_debug;
 
 /*
  * Fixed-point multiplication: (a * b) >> FP_SHIFT
@@ -40,7 +38,7 @@ static inline u32 fp_div(u32 a, u32 b)
 {
 	if (b == 0)
 		return FP_ONE;
-	return (u32)(((u64)a << FP_SHIFT) / b);
+	return (u32)div_u64((u64)a << FP_SHIFT, b);
 }
 
 /**
@@ -95,22 +93,37 @@ void infnoise_health_free(struct infnoise_health *health)
 }
 
 /**
- * infnoise_health_reset - Reset entropy counters
+ * infnoise_health_reset - Return health state to its initial values
  * @health: Health check state structure
  *
- * Resets the per-sample entropy counters without clearing
- * the accumulated statistics tables.
+ * Clears the prediction tables and all counters, so that the device must
+ * collect INM_MIN_DATA new bits before it can pass again.
  */
 void infnoise_health_reset(struct infnoise_health *health)
 {
+	size_t table_size = INM_TABLE_SIZE * sizeof(u32);
+
+	memset(health->ones_even, 0, table_size);
+	memset(health->zeros_even, 0, table_size);
+	memset(health->ones_odd, 0, table_size);
+	memset(health->zeros_odd, 0, table_size);
+
+	health->prev_bits = 0;
 	health->num_bits_sampled = 0;
-	health->current_prob = FP_ONE;
 	health->num_bits_of_entropy = 0;
 	health->entropy_level = 0;
+	health->total_bits = 0;
 	health->total_ones = 0;
 	health->total_zeros = 0;
 	health->even_misfires = 0;
 	health->odd_misfires = 0;
+	health->seq_zeros = 0;
+	health->seq_ones = 0;
+	health->current_prob = FP_ONE;
+	health->prev_bit = false;
+	health->prev_even = false;
+	health->prev_odd = false;
+	health->ok_to_use = false;
 }
 
 /*
@@ -199,8 +212,8 @@ bool infnoise_health_add_bit(struct infnoise_health *health, bool even_bit,
 			health->seq_zeros = 0;
 
 			if (health->seq_ones > INM_MAX_SEQUENCE) {
-				pr_crit("infnoise: stuck-at-1 fault detected (%u consecutive 1s)\n",
-					health->seq_ones);
+				pr_warn_ratelimited("infnoise: stuck-at-1 fault detected (%u consecutive 1s)\n",
+						    health->seq_ones);
 				return false;
 			}
 		} else {
@@ -209,8 +222,8 @@ bool infnoise_health_add_bit(struct infnoise_health *health, bool even_bit,
 			health->seq_ones = 0;
 
 			if (health->seq_zeros > INM_MAX_SEQUENCE) {
-				pr_crit("infnoise: stuck-at-0 fault detected (%u consecutive 0s)\n",
-					health->seq_zeros);
+				pr_warn_ratelimited("infnoise: stuck-at-0 fault detected (%u consecutive 0s)\n",
+						    health->seq_zeros);
 				return false;
 			}
 		}

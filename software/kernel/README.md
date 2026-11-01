@@ -5,7 +5,7 @@ A Linux kernel module for the Infinite Noise TRNG USB device. This driver direct
 ## Features
 
 - Hardware random number generator (hwrng) interface at `/dev/hwrng`
-- Automatic entropy feeding to kernel CRNG (no rngd required on Linux 3.16+)
+- Automatic entropy feeding to kernel CRNG (no rngd required)
 - Character device interface at `/dev/infnoiseX`
 - Real-time health monitoring with entropy validation
 - Keccak-1600 sponge for cryptographic whitening
@@ -105,7 +105,7 @@ lsusb -d 1209:3701 -v 2>/dev/null | grep -E "idVendor|idProduct|iProduct|iManufa
 
 ### Prerequisites
 
-- Linux kernel headers for your running kernel
+- Linux 5.9 or newer, with the kernel headers for your running kernel
 - GCC and make
 - Root access for loading/testing
 
@@ -126,6 +126,8 @@ sudo pacman -S linux-headers base-devel
 cd software/kernel
 make
 ```
+
+`make` does not compile in `dev_dbg()` output. To use the `debug` parameter without dynamic debug, build with `make INFNOISE_DEBUG=1`.
 
 ## Installation
 
@@ -167,8 +169,10 @@ sudo rmmod infnoise
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `debug` | bool | false | Enable verbose debug output |
-| `raw_mode` | bool | false | Output raw (unwhitened) data |
-| `multiplier` | uint | 1 | Keccak output multiplier (0-10) |
+| `raw_mode` | bool | false | Output raw (unwhitened) data on `/dev/infnoiseX` |
+| `multiplier` | uint | 1 | `/dev/infnoiseX` Keccak output multiplier (0-10) |
+
+These two settings do not affect `/dev/hwrng`. That interface always returns whitened data with no multiplier, because the kernel credits it at a fixed quality.
 
 ### Setting Parameters at Load Time
 
@@ -191,7 +195,7 @@ cat /sys/module/infnoise/parameters/multiplier
 
 ### Multiplier Values
 
-The `multiplier` parameter controls how much data is squeezed from the Keccak sponge per entropy absorption:
+The `multiplier` parameter controls how much data `/dev/infnoiseX` squeezes from the Keccak sponge per entropy absorption:
 
 | Value | Output per Round | Approximate Speed |
 |-------|------------------|-------------------|
@@ -215,7 +219,7 @@ sudo dd if=/dev/hwrng bs=64 count=10 | xxd
 sudo dd if=/dev/infnoise0 bs=64 count=10 | xxd
 
 # Generate a random file
-sudo dd if=/dev/hwrng of=random.bin bs=1M count=10
+sudo dd if=/dev/hwrng of=random.bin bs=1M count=10 iflag=fullblock
 ```
 
 ### Checking Device Status
@@ -238,16 +242,16 @@ cat /sys/class/misc/hw_random/rng_current
 sudo apt install rng-tools  # Debian/Ubuntu
 
 # Run FIPS tests
-sudo dd if=/dev/hwrng bs=2500 count=100 | rngtest -c 100
+sudo dd if=/dev/hwrng bs=2500 count=100 iflag=fullblock | rngtest -c 100
 ```
 
 ### Automatic Entropy Feeding
 
-Since Linux kernel 3.16+, the hwrng subsystem automatically feeds entropy to the kernel's random pool via an internal kernel thread (`hwrng_fillfn`). **No rngd daemon is required.**
+The hwrng subsystem automatically feeds entropy to the kernel's random pool via an internal kernel thread (`hwrng_fillfn`). **No rngd daemon is required.**
 
-The driver dynamically sets the quality parameter based on the output mode:
-- **Whitened mode (default)**: quality=990 (Keccak output is cryptographically uniform)
-- **Raw mode**: quality=880 (reflects the ~0.88 bits/bit true entropy rate)
+The driver registers with quality=990. Each 256-bit output comes from one absorption of about 450 bits of entropy, so the output is close to full entropy.
+
+A non-blocking read of `/dev/hwrng` returns `EAGAIN` during warmup or while another reader is using the device. Otherwise it makes one USB transfer, so it can still block briefly, and can return `EAGAIN` if the health check rejects that data.
 
 The hwrng core thread continuously:
 1. Reads data from the device
@@ -265,7 +269,7 @@ cat /sys/class/misc/hw_random/rng_current
 
 ### Using with rngd (Optional, Legacy)
 
-On older kernels (<3.16) or if you prefer manual control, you can use `rngd`:
+If you prefer manual control, you can use `rngd`:
 
 ```bash
 # Install rng-tools
@@ -275,7 +279,7 @@ sudo apt install rng-tools
 sudo rngd -r /dev/hwrng
 ```
 
-On modern kernels, this is redundant since the hwrng core already handles entropy feeding.
+This is redundant, since the hwrng core already handles entropy feeding.
 
 ## Troubleshooting
 
@@ -313,7 +317,7 @@ sudo insmod infnoise.ko debug=1
 
 ### Health Check Failures
 
-Occasional health check failures during warmup are normal. Persistent failures after warmup may indicate a hardware issue:
+Occasional health check failures during warmup are normal, and the driver starts counting again, up to 10 times. A failure after warmup makes one read return `EIO`, and the driver then warms up again. It stops after more than 5 such failures, unless 10 minutes pass between two of them. If warmup fails or the driver stops, reads return `EIO` until the device is reconnected or the system resumes from sleep. This may indicate a hardware issue:
 
 ```bash
 # Monitor health status
@@ -322,15 +326,17 @@ dmesg -w | grep infnoise
 
 ### Permission Denied
 
-The device files are owned by root by default. To allow non-root access:
+The device files are owned by root by default. To allow non-root access for one group:
 
 ```bash
+# Create the group, and add your user to it
+sudo groupadd --system infnoise
+sudo usermod -aG infnoise "$USER"
+
 # Create udev rule for permissions
 cat << 'EOF' | sudo tee /etc/udev/rules.d/99-infnoise.rules
-# Infinite Noise TRNG - allow user access
-SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="3701", MODE="0666"
-KERNEL=="infnoise*", MODE="0666"
-KERNEL=="hwrng", MODE="0666"
+# Infinite Noise TRNG - allow group access
+KERNEL=="infnoise*", GROUP="infnoise", MODE="0640"
 EOF
 
 sudo udevadm control --reload-rules
@@ -353,6 +359,21 @@ EOF
 # Flash (may need to specify current VID/PID)
 sudo ftdi_eeprom --flash-eeprom --device i:0x1209:0x3701 ftdi_restore.conf
 ```
+
+## Testing
+
+```bash
+# Read interfaces, ioctls, concurrent readers and entropy quality
+sudo make test
+
+# Also unbind and reset the device while it is open
+sudo make test-destructive
+
+# Also suspend the system for 10 seconds with the device open
+sudo ./test_infnoise --destructive --suspend
+```
+
+Run the destructive tests on a kernel with `CONFIG_KASAN`, `CONFIG_PROVE_LOCKING` and `CONFIG_DETECT_HUNG_TASK`. They do not cover USB errors or a failed warmup, which need a failing device. To test these, unplug the device during a read.
 
 ## USB Device ID
 

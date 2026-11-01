@@ -15,7 +15,8 @@
 #include <linux/usb.h>
 #include <linux/hw_random.h>
 #include <linux/mutex.h>
-#include <linux/completion.h>
+#include <linux/kref.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 /* USB device IDs - Infinite Noise TRNG (pid.codes registered) */
@@ -79,7 +80,10 @@
 #define FTDI_PACKET_SIZE	64
 #define FTDI_STATUS_SIZE	2
 #define FTDI_DATA_PER_PACKET	(FTDI_PACKET_SIZE - FTDI_STATUS_SIZE)  /* 62 */
-/* For 512 bytes of data, we need ceil(512/62) = 9 packets = 576 bytes */
+/*
+ * Size of each bulk IN request. It must be a multiple of the packet size, and
+ * it holds the 9 packets (576 bytes) that 512 data bytes can need.
+ */
 #define INFNOISE_USB_READ_SIZE	(((INFNOISE_BUFLEN + FTDI_DATA_PER_PACKET - 1) / FTDI_DATA_PER_PACKET) * FTDI_PACKET_SIZE)
 
 /* Health check constants */
@@ -111,25 +115,26 @@
 #define KECCAK_ROUNDS		24	/* Number of rounds */
 
 /*
- * hwrng quality settings (bits of entropy per 1024 bits of input)
- * - Raw mode: 0.88 bits/bit (unwhitened, reflects true entropy rate)
- * - Whitened mode: ~1.0 bits/bit (Keccak output is cryptographically uniform)
+ * hwrng quality (bits of entropy per 1024 bits of output). The hwrng interface
+ * always returns at most 256 whitened bits per absorption of about 450 bits of
+ * entropy, so its output is close to full entropy with a slight margin.
  */
-#define INFNOISE_QUALITY_RAW		880	/* Raw: 0.88 bits/bit */
-#define INFNOISE_QUALITY_WHITENED	990	/* Whitened: ~1.0 bits/bit, slight margin */
+#define INFNOISE_QUALITY_WHITENED	990
 
 /* Timeouts */
 #define INFNOISE_USB_TIMEOUT	1000	/* USB timeout in ms */
 #define INFNOISE_WARMUP_ROUNDS	5000	/* Max warmup rounds */
+#define INFNOISE_WARMUP_MAX_ERRORS	8	/* Failed rounds in a row before warmup fails */
+#define INFNOISE_WARMUP_MAX_FAULTS	10	/* Health faults before warmup fails */
+#define INFNOISE_MAX_HEALTH_RECOVERIES	5	/* Warmups after a fault before giving up */
+#define INFNOISE_HEALTH_FORGET_SECS	600	/* Fault free time that resets the count */
+#define INFNOISE_HWRNG_WAIT_MS	5000	/* Max hwrng wait for warmup */
+#define INFNOISE_HWRNG_TRIES	16	/* Transfers per hwrng read */
 
 /* Error recovery */
 #define INFNOISE_MAX_RETRIES		3	/* Retries per transfer */
 #define INFNOISE_RECOVERY_THRESHOLD	5	/* Consecutive errors before recovery */
 #define INFNOISE_RETRY_DELAY_MS		10	/* Delay between retries */
-
-/* Module parameters */
-extern bool infnoise_debug;
-extern bool infnoise_raw_mode;
 
 /* IOCTL definitions */
 #define INFNOISE_IOC_MAGIC	'N'
@@ -190,19 +195,25 @@ struct infnoise_health {
 
 /* Keccak state */
 struct infnoise_keccak {
-	u8 state[KECCAK_STATE_SIZE];
+	union {
+		u8 state[KECCAK_STATE_SIZE];
+		u64 lanes[KECCAK_LANES];
+	};
 };
 
-/* Device state flags */
+/* Device state flags (bit numbers for set_bit() and test_bit()) */
 enum infnoise_flags {
-	INFNOISE_PRESENT	= BIT(0),	/* Device is connected */
-	INFNOISE_WARMUP_DONE	= BIT(1),	/* Warmup complete */
-	INFNOISE_HWRNG_REG	= BIT(2),	/* hwrng registered */
-	INFNOISE_HEALTH_FAIL	= BIT(3),	/* Health check failed */
+	INFNOISE_PRESENT	= 0,	/* Device is connected */
+	INFNOISE_WARMUP_DONE	= 1,	/* Warmup complete */
+	INFNOISE_HWRNG_REG	= 2,	/* hwrng registered */
+	INFNOISE_HEALTH_FAIL	= 3,	/* Warmup failed */
+	INFNOISE_SUSPENDED	= 4,	/* No USB I/O until resume */
+	INFNOISE_RESET_PENDING	= 5,	/* Unusable until a queued reset runs */
 };
 
 /* Main device structure */
 struct infnoise_device {
+	struct kref kref;		/* Held by the driver binding and open files */
 	struct usb_device *udev;
 	struct usb_interface *intf;
 
@@ -226,13 +237,11 @@ struct infnoise_device {
 	char hwrng_name[32];
 
 	/* Character device */
-	struct usb_class_driver class;
-	int minor;
 	bool raw_mode;		/* Per-device raw mode */
 
 	/* Synchronization */
 	struct mutex lock;		/* Device access lock */
-	struct completion warmup_done;	/* Warmup completion */
+	wait_queue_head_t warmup_wq;	/* Woken when warmup state settles */
 	unsigned long flags;
 
 	/* Warmup work */
@@ -242,6 +251,8 @@ struct infnoise_device {
 	u64 bytes_generated;
 	u32 usb_errors;
 	u32 consecutive_errors;		/* Consecutive USB errors */
+	u32 health_recoveries;		/* Warmups after a fault, recently */
+	unsigned long last_health_fault;	/* In jiffies */
 	u32 recoveries;			/* Successful recovery count */
 };
 
@@ -250,7 +261,7 @@ void infnoise_keccak_init(struct infnoise_keccak *keccak);
 void infnoise_keccak_absorb(struct infnoise_keccak *keccak, const u8 *data,
 			    unsigned int lanes);
 void infnoise_keccak_extract(struct infnoise_keccak *keccak, u8 *data,
-			     unsigned int lanes);
+			     unsigned int bytes);
 void infnoise_keccak_permutation(struct infnoise_keccak *keccak);
 
 /* Health check functions (infnoise_health.c) */

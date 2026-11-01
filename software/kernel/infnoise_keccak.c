@@ -175,7 +175,7 @@ void infnoise_keccak_permutation(struct infnoise_keccak *keccak)
 	keccak_words_to_bytes(keccak->state, state_words);
 #else
 	/* On little-endian, we can work directly on the byte array */
-	keccak_permutation_on_words((u64 *)keccak->state);
+	keccak_permutation_on_words(keccak->lanes);
 #endif
 }
 
@@ -217,17 +217,15 @@ void infnoise_keccak_absorb(struct infnoise_keccak *keccak, const u8 *data,
  * infnoise_keccak_extract - Extract data from Keccak sponge
  * @keccak: Keccak state structure
  * @data: Buffer to store extracted data
- * @lanes: Number of 64-bit lanes to extract (bytes / 8)
+ * @bytes: Number of bytes to extract
  *
  * Copies bytes from the state. Does NOT apply permutation;
  * caller should call keccak_permutation() between extracts
  * if extracting more data than the rate allows.
  */
 void infnoise_keccak_extract(struct infnoise_keccak *keccak, u8 *data,
-			     unsigned int lanes)
+			     unsigned int bytes)
 {
-	unsigned int bytes = lanes * 8;
-
 	if (bytes > KECCAK_STATE_SIZE)
 		bytes = KECCAK_STATE_SIZE;
 

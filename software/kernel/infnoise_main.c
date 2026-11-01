@@ -21,6 +21,9 @@
 #include <linux/workqueue.h>
 #include <linux/uaccess.h>
 #include <linux/compat.h>
+#include <linux/capability.h>
+#include <linux/jiffies.h>
+#include <linux/wait.h>
 #include <linux/sched/signal.h>
 #include <linux/delay.h>
 #include "infnoise.h"
@@ -30,17 +33,17 @@
 #define DRIVER_DESC	"Infinite Noise TRNG driver"
 
 /* Module parameters */
-bool infnoise_debug;
+static bool infnoise_debug;
 module_param_named(debug, infnoise_debug, bool, 0644);
 MODULE_PARM_DESC(debug, "Enable debug output");
 
-bool infnoise_raw_mode;
+static bool infnoise_raw_mode;
 module_param_named(raw_mode, infnoise_raw_mode, bool, 0644);
-MODULE_PARM_DESC(raw_mode, "Output raw (unwhitened) data");
+MODULE_PARM_DESC(raw_mode, "Output raw (unwhitened) data on /dev/infnoiseN");
 
-unsigned int infnoise_multiplier = 1;
+static unsigned int infnoise_multiplier = 1;
 module_param_named(multiplier, infnoise_multiplier, uint, 0644);
-MODULE_PARM_DESC(multiplier, "Output multiplier (0=entropy only, 1-10=multiply output)");
+MODULE_PARM_DESC(multiplier, "/dev/infnoiseN output multiplier (0=entropy only, 1-10=multiply output)");
 
 /* USB device table - only matches reprogrammed devices */
 static const struct usb_device_id infnoise_table[] = {
@@ -51,10 +54,6 @@ MODULE_DEVICE_TABLE(usb, infnoise_table);
 
 /* Forward declarations */
 static struct usb_driver infnoise_driver;
-static void infnoise_warmup_work(struct work_struct *work);
-static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
-			      size_t max_len, bool raw);
-static int infnoise_configure_ftdi(struct infnoise_device *dev);
 
 /*
  * FTDI USB control transfer helper
@@ -68,6 +67,15 @@ static int ftdi_control(struct infnoise_device *dev, u8 request,
 			       USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 			       value, index, NULL, 0,
 			       INFNOISE_USB_TIMEOUT);
+}
+
+/*
+ * Discard samples the FTDI chip has not delivered yet
+ */
+static int infnoise_purge_rx(struct infnoise_device *dev)
+{
+	return ftdi_control(dev, FTDI_SIO_RESET, FTDI_SIO_RESET_PURGE_RX,
+			    FTDI_INDEX_INTERFACE_A);
 }
 
 /*
@@ -119,8 +127,7 @@ static int infnoise_configure_ftdi(struct infnoise_device *dev)
 	}
 
 	/* Purge RX buffer */
-	ret = ftdi_control(dev, FTDI_SIO_RESET, FTDI_SIO_RESET_PURGE_RX,
-			   FTDI_INDEX_INTERFACE_A);
+	ret = infnoise_purge_rx(dev);
 	if (ret < 0) {
 		dev_err(&dev->intf->dev, "Failed to purge RX: %d\n", ret);
 		return ret;
@@ -167,8 +174,12 @@ static int infnoise_test_transfer(struct infnoise_device *dev)
 			   &actual, INFNOISE_USB_TIMEOUT);
 	if (ret < 0) {
 		dev_err(&dev->intf->dev, "Test write failed: %d\n", ret);
-		kfree(test_buf);
-		return ret;
+		goto out;
+	}
+	if (actual != 64) {
+		dev_err(&dev->intf->dev, "Short test write: %d/64\n", actual);
+		ret = -EIO;
+		goto out;
 	}
 
 	/* Test read */
@@ -178,13 +189,46 @@ static int infnoise_test_transfer(struct infnoise_device *dev)
 			   &actual, INFNOISE_USB_TIMEOUT);
 	if (ret < 0) {
 		dev_err(&dev->intf->dev, "Test read failed: %d\n", ret);
-		kfree(test_buf);
-		return ret;
+		goto out;
+	}
+	if (actual < FTDI_STATUS_SIZE) {
+		dev_err(&dev->intf->dev, "Short test read: %d bytes\n", actual);
+		ret = -EIO;
+		goto out;
+	}
+
+	/*
+	 * The rest of the test samples must not enter the first real transfer,
+	 * because they would shift the even/odd sample phase.
+	 */
+	msleep(INFNOISE_RETRY_DELAY_MS);
+	ret = infnoise_purge_rx(dev);
+	if (ret < 0) {
+		dev_err(&dev->intf->dev, "Failed to purge RX: %d\n", ret);
+		goto out;
 	}
 
 	dev_info(&dev->intf->dev, "Test transfer OK (%d bytes)\n", actual);
+	ret = 0;
+out:
 	kfree(test_buf);
-	return 0;
+	return ret;
+}
+
+/*
+ * Stop using the device and reset it from outside the read path
+ *
+ * A reset unbinds this driver, so it must not run on a thread that uses the
+ * device. The USB core calls infnoise_disconnect() and then probes again. The
+ * core drops the reset if it can't get the device lock, so the flag stays set
+ * and infnoise_read_data() queues the reset again. The caller must hold
+ * dev->lock.
+ */
+static void infnoise_queue_reset(struct infnoise_device *dev)
+{
+	set_bit(INFNOISE_RESET_PENDING, &dev->flags);
+	wake_up_all(&dev->warmup_wq);
+	usb_queue_reset_device(dev->intf);
 }
 
 /*
@@ -192,7 +236,7 @@ static int infnoise_test_transfer(struct infnoise_device *dev)
  *
  * This function tries to restore communication with the device after
  * consecutive USB errors. It clears endpoint halts and reconfigures
- * the FTDI chip. If that fails, it attempts a full USB device reset.
+ * the FTDI chip. If that fails, it queues a full USB device reset.
  *
  * Returns 0 on successful recovery, negative error code on failure.
  */
@@ -216,24 +260,11 @@ static int infnoise_try_recovery(struct infnoise_device *dev)
 	ret = infnoise_configure_ftdi(dev);
 	if (ret < 0) {
 		dev_warn(&dev->intf->dev,
-			 "FTDI reconfiguration failed (%d), trying USB reset\n", ret);
+			 "FTDI reconfiguration failed (%d), queueing USB reset\n", ret);
 
 		/* Last resort: reset the USB device */
-		ret = usb_reset_device(dev->udev);
-		if (ret < 0) {
-			dev_err(&dev->intf->dev,
-				"USB reset failed: %d, device may be unusable\n", ret);
-			return ret;
-		}
-
-		/* Reconfigure after reset */
-		msleep(50);
-		ret = infnoise_configure_ftdi(dev);
-		if (ret < 0) {
-			dev_err(&dev->intf->dev,
-				"FTDI configuration after reset failed: %d\n", ret);
-			return ret;
-		}
+		infnoise_queue_reset(dev);
+		return -ENODEV;
 	}
 
 	dev->recoveries++;
@@ -285,10 +316,9 @@ static int infnoise_extract_bytes(struct infnoise_device *dev, u8 *bytes,
 			/* Feed bit to health checker */
 			if (!infnoise_health_add_bit(&dev->health, even_bit,
 						     odd_bit, even)) {
-				dev_err(&dev->intf->dev,
-					"Health check failed!\n");
-				set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
-				return -EIO;
+				dev_err_ratelimited(&dev->intf->dev,
+						    "Health check failed!\n");
+				return -EBADMSG;
 			}
 		}
 		bytes[i] = byte;
@@ -298,38 +328,29 @@ static int infnoise_extract_bytes(struct infnoise_device *dev, u8 *bytes,
 }
 
 /*
- * Strip FTDI modem status bytes from USB data
+ * Strip FTDI modem status bytes from one bulk transfer
  *
  * FTDI sends data in 64-byte packets: 2 status bytes + 62 data bytes.
- * This function extracts just the data bytes.
+ * Each transfer starts on a packet boundary, and only its last packet can be
+ * short. This function appends the data bytes to read_buf and returns the new
+ * number of data bytes held there.
  */
 static int infnoise_strip_ftdi_status(struct infnoise_device *dev,
-				      int usb_bytes)
+				      int usb_bytes, int data_bytes)
 {
-	int packets = usb_bytes / FTDI_PACKET_SIZE;
-	int leftover = usb_bytes % FTDI_PACKET_SIZE;
-	int data_bytes = 0;
-	int i;
+	int offset;
 
-	for (i = 0; i < packets; i++) {
-		u8 *src = dev->usb_buf + i * FTDI_PACKET_SIZE + FTDI_STATUS_SIZE;
-		int copy_len = min(FTDI_DATA_PER_PACKET,
+	for (offset = 0; offset < usb_bytes; offset += FTDI_PACKET_SIZE) {
+		int packet = min(usb_bytes - offset, FTDI_PACKET_SIZE);
+		int copy_len = min(packet - FTDI_STATUS_SIZE,
 				   INFNOISE_BUFLEN - data_bytes);
 
 		if (copy_len > 0) {
-			memcpy(dev->read_buf + data_bytes, src, copy_len);
+			memcpy(dev->read_buf + data_bytes,
+			       dev->usb_buf + offset + FTDI_STATUS_SIZE,
+			       copy_len);
 			data_bytes += copy_len;
 		}
-	}
-
-	/* Handle partial packet at end if any */
-	if (leftover > FTDI_STATUS_SIZE && data_bytes < INFNOISE_BUFLEN) {
-		int copy_len = min(leftover - FTDI_STATUS_SIZE,
-				   INFNOISE_BUFLEN - data_bytes);
-		u8 *src = dev->usb_buf + packets * FTDI_PACKET_SIZE + FTDI_STATUS_SIZE;
-
-		memcpy(dev->read_buf + data_bytes, src, copy_len);
-		data_bytes += copy_len;
 	}
 
 	return data_bytes;
@@ -345,8 +366,8 @@ static int infnoise_usb_transfer_once(struct infnoise_device *dev)
 {
 	int ret;
 	int actual;
-	int total_read = 0;
-	int data_bytes;
+	int data_bytes = 0;
+	unsigned long deadline;
 
 	/* Write clock pattern */
 	ret = usb_bulk_msg(dev->udev,
@@ -367,14 +388,16 @@ static int infnoise_usb_transfer_once(struct infnoise_device *dev)
 
 	/*
 	 * Read samples - FTDI returns data in 64-byte packets with 2 status
-	 * bytes per packet. We need to read until we have enough data bytes.
+	 * bytes per packet, and also sends status-only packets while it has no
+	 * data. Packets are parsed per transfer, because a short transfer ends
+	 * in the middle of the buffer. The deadline stops a device that only
+	 * ever sends status packets.
 	 */
-	while (total_read < INFNOISE_USB_READ_SIZE) {
-		int remaining = INFNOISE_USB_READ_SIZE - total_read;
-
+	deadline = jiffies + msecs_to_jiffies(INFNOISE_USB_TIMEOUT);
+	while (data_bytes < INFNOISE_BUFLEN) {
 		ret = usb_bulk_msg(dev->udev,
 				   usb_rcvbulkpipe(dev->udev, dev->bulk_in_ep),
-				   dev->usb_buf + total_read, remaining,
+				   dev->usb_buf, INFNOISE_USB_READ_SIZE,
 				   &actual, INFNOISE_USB_TIMEOUT);
 		if (ret < 0) {
 			if (infnoise_debug)
@@ -382,27 +405,15 @@ static int infnoise_usb_transfer_once(struct infnoise_device *dev)
 			return ret;
 		}
 
-		if (actual == 0) {
+		data_bytes = infnoise_strip_ftdi_status(dev, actual, data_bytes);
+
+		if (data_bytes < INFNOISE_BUFLEN &&
+		    (actual == 0 || time_after(jiffies, deadline))) {
 			if (infnoise_debug)
 				dev_dbg(&dev->intf->dev, "USB read timeout, got %d/%d\n",
-					total_read, INFNOISE_USB_READ_SIZE);
+					data_bytes, INFNOISE_BUFLEN);
 			return -ETIMEDOUT;
 		}
-
-		total_read += actual;
-
-		if (infnoise_debug && total_read < INFNOISE_USB_READ_SIZE)
-			dev_dbg(&dev->intf->dev, "Partial read: %d/%d, continuing\n",
-				total_read, INFNOISE_USB_READ_SIZE);
-	}
-
-	/* Strip FTDI status bytes to get actual data */
-	data_bytes = infnoise_strip_ftdi_status(dev, total_read);
-
-	if (data_bytes < INFNOISE_BUFLEN) {
-		dev_err(&dev->intf->dev, "Short data: %d/%d bytes\n",
-			data_bytes, INFNOISE_BUFLEN);
-		return -EIO;
 	}
 
 	/* Extract entropy bits */
@@ -445,9 +456,19 @@ static int infnoise_usb_transfer(struct infnoise_device *dev)
 	int retry;
 
 	for (retry = 0; retry < INFNOISE_MAX_RETRIES; retry++) {
+		/*
+		 * Let the clocks of a failed attempt finish, also one of an
+		 * earlier call. Its samples would shift the phase.
+		 */
+		if (dev->consecutive_errors) {
+			msleep(INFNOISE_RETRY_DELAY_MS);
+			infnoise_purge_rx(dev);
+		}
+
 		ret = infnoise_usb_transfer_once(dev);
 
-		if (ret >= 0) {
+		/* A health fault is about the samples, not the USB transfer */
+		if (ret >= 0 || ret == -EBADMSG) {
 			/* Success - reset consecutive error counter */
 			dev->consecutive_errors = 0;
 			return ret;
@@ -462,6 +483,12 @@ static int infnoise_usb_transfer(struct infnoise_device *dev)
 			if (infnoise_debug)
 				dev_dbg(&dev->intf->dev,
 					"Non-recoverable error: %d\n", ret);
+			/*
+			 * The USB core disables the endpoints before it calls
+			 * infnoise_disconnect(), so these mean the device is going.
+			 */
+			if (ret == -ESHUTDOWN || ret == -ENOENT || ret == -EINVAL)
+				return -ENODEV;
 			return ret;
 		}
 
@@ -475,15 +502,6 @@ static int infnoise_usb_transfer(struct infnoise_device *dev)
 				return recovery_ret;
 			}
 			/* Recovery succeeded, retry counter continues */
-		}
-
-		/* Brief delay before retry */
-		if (retry < INFNOISE_MAX_RETRIES - 1) {
-			if (infnoise_debug)
-				dev_dbg(&dev->intf->dev,
-					"Retry %d/%d after error %d\n",
-					retry + 1, INFNOISE_MAX_RETRIES, ret);
-			msleep(INFNOISE_RETRY_DELAY_MS);
 		}
 	}
 
@@ -506,7 +524,7 @@ static int infnoise_keccak_squeeze(struct infnoise_device *dev, u8 *result,
 
 	/* Extract at most 128 bytes (16 lanes) for security margin */
 	out_bytes = min_t(size_t, max_len, 128);
-	infnoise_keccak_extract(&dev->keccak, result, (out_bytes + 7) / 8);
+	infnoise_keccak_extract(&dev->keccak, result, out_bytes);
 
 	/* Permute state for next extraction */
 	infnoise_keccak_permutation(&dev->keccak);
@@ -519,17 +537,27 @@ static int infnoise_keccak_squeeze(struct infnoise_device *dev, u8 *result,
  *
  * This is the main data path used by both hwrng and character device.
  * Supports multiplier for increased output rate from Keccak sponge.
+ * The caller must hold dev->lock. Returns the number of bytes read, 0 if data
+ * was discarded, -EBADMSG on a health fault, or another negative error.
  */
 static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
-			      size_t max_len, bool raw)
+			      size_t max_len, bool raw, unsigned int mult)
 {
 	int entropy;
 	size_t out_bytes;
-	unsigned int mult;
 
 	/* Check device is still present */
 	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
 		return -ENODEV;
+
+	if (test_bit(INFNOISE_SUSPENDED, &dev->flags))
+		return 0;
+
+	/* This does nothing if the reset is still queued */
+	if (test_bit(INFNOISE_RESET_PENDING, &dev->flags)) {
+		usb_queue_reset_device(dev->intf);
+		return -ENODEV;
+	}
 
 	/*
 	 * If we have bytes left from a previous absorption (multiplier > 1),
@@ -575,10 +603,6 @@ static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
 	infnoise_keccak_absorb(&dev->keccak, dev->out_buf, INFNOISE_BYTES_OUT / 8);
 
 	/* Calculate total bytes to output based on multiplier */
-	mult = infnoise_multiplier;
-	if (mult > 10)
-		mult = 10;  /* Cap at 10x for sanity */
-
 	if (mult == 0) {
 		/* Output only entropy bits worth of data */
 		out_bytes = entropy / 8;
@@ -601,88 +625,202 @@ static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
 
 /*
  * Warmup work function - runs in workqueue context
+ *
+ * Takes the lock per round, so that ioctls and disconnect wait for at most
+ * one transfer.
  */
 static void infnoise_warmup_work(struct work_struct *work)
 {
 	struct infnoise_device *dev = container_of(work, struct infnoise_device,
 						   warmup_work);
-	unsigned int rounds = 0;
+	unsigned int rounds;
+	unsigned int errors = 0;
+	unsigned int faults = 0;
+	bool ready = false;
+	int ret = 0;
 	u8 discard[64];
 
 	dev_info(&dev->intf->dev, "Starting warmup...\n");
 
-	mutex_lock(&dev->lock);
+	for (rounds = 0; rounds < INFNOISE_WARMUP_ROUNDS; rounds++) {
+		mutex_lock(&dev->lock);
 
-	while (!infnoise_health_ok(&dev->health) &&
-	       rounds < INFNOISE_WARMUP_ROUNDS &&
-	       test_bit(INFNOISE_PRESENT, &dev->flags)) {
-		infnoise_read_data(dev, discard, sizeof(discard), true);
-		rounds++;
+		if (!test_bit(INFNOISE_PRESENT, &dev->flags) ||
+		    test_bit(INFNOISE_SUSPENDED, &dev->flags)) {
+			mutex_unlock(&dev->lock);
+			goto out;
+		}
+
+		ready = infnoise_health_ok(&dev->health);
+		if (!ready) {
+			ret = infnoise_read_data(dev, discard, sizeof(discard),
+						 true, 0);
+			/* A few faults are normal, so start counting again */
+			if (ret == -EBADMSG) {
+				if (++faults >= INFNOISE_WARMUP_MAX_FAULTS) {
+					mutex_unlock(&dev->lock);
+					break;
+				}
+				infnoise_health_reset(&dev->health);
+				ret = 0;
+			}
+		}
+
+		mutex_unlock(&dev->lock);
+
+		if (ready)
+			break;
+
+		if (ret >= 0) {
+			errors = 0;
+			continue;
+		}
+
+		/* Keep going on a temporary error, so that recovery can run */
+		if (!infnoise_is_recoverable_error(ret) ||
+		    ++errors >= INFNOISE_WARMUP_MAX_ERRORS)
+			break;
 	}
 
-	mutex_unlock(&dev->lock);
-
-	if (!test_bit(INFNOISE_PRESENT, &dev->flags)) {
+	if (ret == -ENODEV) {
 		dev_info(&dev->intf->dev, "Device disconnected during warmup\n");
-		return;
-	}
-
-	if (rounds >= INFNOISE_WARMUP_ROUNDS) {
-		dev_err(&dev->intf->dev,
-			"Warmup failed after %u rounds\n", rounds);
-		set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
-	} else {
+	} else if (ready) {
 		dev_info(&dev->intf->dev,
 			 "Warmup complete after %u rounds\n", rounds);
 		set_bit(INFNOISE_WARMUP_DONE, &dev->flags);
+	} else {
+		dev_err(&dev->intf->dev,
+			"Warmup failed after %u rounds: %d\n", rounds, ret);
+		set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
 	}
 
-	complete(&dev->warmup_done);
+out:
+	memzero_explicit(discard, sizeof(discard));
+	wake_up_all(&dev->warmup_wq);
 }
 
-/* ============== hwrng interface ============== */
-
-static int infnoise_hwrng_read(struct hwrng *rng, void *data, size_t max,
-			       bool wait)
+/*
+ * Reset health state and warm up again. The caller must hold dev->lock.
+ */
+static void infnoise_restart_warmup(struct infnoise_device *dev)
 {
-	struct infnoise_device *dev = (struct infnoise_device *)rng->priv;
-	bool raw = infnoise_raw_mode || dev->raw_mode;
-	int ret;
+	clear_bit(INFNOISE_WARMUP_DONE, &dev->flags);
+	clear_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
+	infnoise_health_reset(&dev->health);
+	dev->keccak_bytes_left = 0;
+	queue_work(system_long_wq, &dev->warmup_work);
+}
 
-	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
-		return -ENODEV;
+/*
+ * Read for a consumer, and handle a health fault by warming up again, unless
+ * the device keeps failing. The kernel credits what passes the checks, so a
+ * failing device must stop. The caller must hold dev->lock.
+ */
+static int infnoise_read_checked(struct infnoise_device *dev, u8 *result,
+				 size_t max_len, bool raw, unsigned int mult)
+{
+	int ret = infnoise_read_data(dev, result, max_len, raw, mult);
 
-	/*
-	 * Update hwrng quality based on current raw mode setting.
-	 * Raw output has ~0.88 bits entropy per bit.
-	 * Whitened (Keccak) output is cryptographically uniform (~1.0 bits/bit).
-	 */
-	dev->hwrng.quality = raw ? INFNOISE_QUALITY_RAW : INFNOISE_QUALITY_WHITENED;
+	if (ret == -EBADMSG) {
+		if (time_after(jiffies, dev->last_health_fault +
+			       INFNOISE_HEALTH_FORGET_SECS * HZ))
+			dev->health_recoveries = 0;
+		dev->last_health_fault = jiffies;
 
-	/* Wait for warmup if requested */
-	if (wait && !test_bit(INFNOISE_WARMUP_DONE, &dev->flags)) {
-		ret = wait_for_completion_interruptible(&dev->warmup_done);
-		if (ret)
-			return ret;
+		if (++dev->health_recoveries > INFNOISE_MAX_HEALTH_RECOVERIES) {
+			dev_err(&dev->intf->dev,
+				"Too many health check failures, stopping\n");
+			clear_bit(INFNOISE_WARMUP_DONE, &dev->flags);
+			set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
+			wake_up_all(&dev->warmup_wq);
+			return -EIO;
+		}
+		infnoise_restart_warmup(dev);
+		return -EIO;
 	}
 
-	if (!test_bit(INFNOISE_WARMUP_DONE, &dev->flags))
-		return 0;
+	return ret;
+}
+
+/* True when a reader no longer needs to wait for warmup */
+static bool infnoise_warmup_settled(struct infnoise_device *dev)
+{
+	return test_bit(INFNOISE_WARMUP_DONE, &dev->flags) ||
+	       test_bit(INFNOISE_HEALTH_FAIL, &dev->flags) ||
+	       test_bit(INFNOISE_RESET_PENDING, &dev->flags) ||
+	       !test_bit(INFNOISE_PRESENT, &dev->flags);
+}
+
+/* Error for a reader once warmup has settled */
+static int infnoise_settled_status(struct infnoise_device *dev)
+{
+	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
+		return -ENODEV;
 
 	if (test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
 		return -EIO;
 
-	mutex_lock(&dev->lock);
-	ret = infnoise_read_data(dev, data, max, raw);
-	mutex_unlock(&dev->lock);
+	return 0;
+}
 
-	return ret;
+/* ============== hwrng interface ============== */
+
+/*
+ * The kernel credits this data at a fixed quality, so this interface ignores
+ * the raw mode and multiplier settings of the character device. It also drops
+ * bytes left over from a multiplied absorption, which would not earn that
+ * credit. With wait=false, it makes one attempt if warmup is done and nobody
+ * else holds the device, so it blocks for one transfer at most.
+ */
+static int infnoise_hwrng_read(struct hwrng *rng, void *data, size_t max,
+			       bool wait)
+{
+	struct infnoise_device *dev = (struct infnoise_device *)rng->priv;
+	unsigned int tries;
+	long left;
+	int ret;
+
+	if (wait) {
+		/* The core retries on 0, and the fill thread must not block forever */
+		left = wait_event_interruptible_timeout(dev->warmup_wq,
+							infnoise_warmup_settled(dev),
+							msecs_to_jiffies(INFNOISE_HWRNG_WAIT_MS));
+		if (left < 0)
+			return left;
+		if (left == 0)
+			return 0;
+	} else if (!infnoise_warmup_settled(dev)) {
+		return 0;
+	}
+
+	ret = infnoise_settled_status(dev);
+	if (ret)
+		return ret;
+
+	/* The core sleeps for 10 s after a return of 0, so retry discarded data */
+	for (tries = 0; tries < (wait ? INFNOISE_HWRNG_TRIES : 1); tries++) {
+		if (wait) {
+			ret = mutex_lock_interruptible(&dev->lock);
+			if (ret)
+				return ret;
+		} else if (!mutex_trylock(&dev->lock)) {
+			return 0;
+		}
+
+		dev->keccak_bytes_left = 0;
+		ret = infnoise_read_checked(dev, data, max, false, 1);
+		mutex_unlock(&dev->lock);
+
+		if (ret || signal_pending(current))
+			return ret;
+	}
+
+	return 0;
 }
 
 static int infnoise_hwrng_register(struct infnoise_device *dev)
 {
 	int ret;
-	bool raw = infnoise_raw_mode || dev->raw_mode;
 
 	snprintf(dev->hwrng_name, sizeof(dev->hwrng_name),
 		 "infnoise-%s", dev_name(&dev->intf->dev));
@@ -690,7 +828,7 @@ static int infnoise_hwrng_register(struct infnoise_device *dev)
 	dev->hwrng.name = dev->hwrng_name;
 	dev->hwrng.read = infnoise_hwrng_read;
 	dev->hwrng.priv = (unsigned long)dev;
-	dev->hwrng.quality = raw ? INFNOISE_QUALITY_RAW : INFNOISE_QUALITY_WHITENED;
+	dev->hwrng.quality = INFNOISE_QUALITY_WHITENED;
 
 	ret = hwrng_register(&dev->hwrng);
 	if (ret) {
@@ -715,6 +853,29 @@ static void infnoise_hwrng_unregister(struct infnoise_device *dev)
 
 /* ============== Character device interface ============== */
 
+/*
+ * Free the device when the last open file and the driver binding are gone
+ */
+static void infnoise_delete(struct kref *kref)
+{
+	struct infnoise_device *dev = container_of(kref, struct infnoise_device,
+						   kref);
+
+	infnoise_health_free(&dev->health);
+	kfree(dev->clock_buf);
+	kfree_sensitive(dev->usb_buf);
+	kfree_sensitive(dev->read_buf);
+	kfree_sensitive(dev->out_buf);
+	usb_put_intf(dev->intf);
+	usb_put_dev(dev->udev);
+	kfree_sensitive(dev);
+}
+
+/*
+ * The USB core holds minor_rwsem around this function, and
+ * usb_deregister_dev() takes it for writing. So disconnect cannot drop its
+ * reference until this function has returned.
+ */
 static int infnoise_open(struct inode *inode, struct file *file)
 {
 	struct infnoise_device *dev;
@@ -731,6 +892,7 @@ static int infnoise_open(struct inode *inode, struct file *file)
 	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
 		return -ENODEV;
 
+	kref_get(&dev->kref);
 	file->private_data = dev;
 
 	return 0;
@@ -738,6 +900,10 @@ static int infnoise_open(struct inode *inode, struct file *file)
 
 static int infnoise_release(struct inode *inode, struct file *file)
 {
+	struct infnoise_device *dev = file->private_data;
+
+	kref_put(&dev->kref, infnoise_delete);
+
 	return 0;
 }
 
@@ -745,58 +911,78 @@ static ssize_t infnoise_char_read(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
 	struct infnoise_device *dev = file->private_data;
+	bool nonblock = file->f_flags & O_NONBLOCK;
 	u8 data[128];
 	size_t chunk;
 	ssize_t total = 0;
-	int ret;
+	int ret = 0;
 
 	if (!dev)
 		return -ENODEV;
 
-	/* Wait for warmup */
-	if (!test_bit(INFNOISE_WARMUP_DONE, &dev->flags)) {
-		if (file->f_flags & O_NONBLOCK)
-			return -EAGAIN;
-
-		ret = wait_for_completion_interruptible(&dev->warmup_done);
-		if (ret)
-			return ret;
-	}
-
-	if (test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
-		return -EIO;
-
 	while (total < count) {
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			break;
+		}
+
+		/* Wait for warmup, which a health fault can start again */
+		if (!infnoise_warmup_settled(dev)) {
+			if (total > 0)
+				break;
+			if (nonblock) {
+				ret = -EAGAIN;
+				break;
+			}
+
+			ret = wait_event_interruptible(dev->warmup_wq,
+						       infnoise_warmup_settled(dev));
+			if (ret)
+				break;
+		}
+
+		ret = infnoise_settled_status(dev);
+		if (ret)
+			break;
+
 		chunk = min(count - total, sizeof(data));
 
-		mutex_lock(&dev->lock);
-		ret = infnoise_read_data(dev, data, chunk,
-					 infnoise_raw_mode || dev->raw_mode);
+		ret = mutex_lock_interruptible(&dev->lock);
+		if (ret)
+			break;
+		ret = infnoise_read_checked(dev, data, chunk,
+					    READ_ONCE(infnoise_raw_mode) || dev->raw_mode,
+					    min(READ_ONCE(infnoise_multiplier), 10U));
 		mutex_unlock(&dev->lock);
 
 		if (ret < 0)
-			return total ? total : ret;
+			break;
 
 		if (ret == 0) {
 			/* No data available yet (warmup / entropy below target) */
 			if (total > 0)
 				break;
-			if (file->f_flags & O_NONBLOCK)
-				return -EAGAIN;
+			if (nonblock) {
+				ret = -EAGAIN;
+				break;
+			}
 			/* Yield CPU and back off to avoid busy-wait / soft lockup */
 			msleep(INFNOISE_RETRY_DELAY_MS);
-			if (signal_pending(current))
-				return -ERESTARTSYS;
 			continue;
 		}
 
-		if (copy_to_user(buf + total, data, ret))
-			return -EFAULT;
+		if (copy_to_user(buf + total, data, ret)) {
+			ret = -EFAULT;
+			break;
+		}
 
 		total += ret;
+		cond_resched();
 	}
 
-	return total;
+	memzero_explicit(data, sizeof(data));
+
+	return total ? total : ret;
 }
 
 static long infnoise_ioctl(struct file *file, unsigned int cmd,
@@ -805,6 +991,7 @@ static long infnoise_ioctl(struct file *file, unsigned int cmd,
 	struct infnoise_device *dev = file->private_data;
 	struct infnoise_stats stats = {};
 	int raw;
+	int ret;
 	u32 entropy;
 
 	if (!dev)
@@ -812,7 +999,9 @@ static long infnoise_ioctl(struct file *file, unsigned int cmd,
 
 	switch (cmd) {
 	case INFNOISE_GET_STATS:
-		mutex_lock(&dev->lock);
+		ret = mutex_lock_interruptible(&dev->lock);
+		if (ret)
+			return ret;
 		infnoise_health_get_stats(&dev->health, &stats);
 		mutex_unlock(&dev->lock);
 		if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
@@ -820,13 +1009,18 @@ static long infnoise_ioctl(struct file *file, unsigned int cmd,
 		return 0;
 
 	case INFNOISE_SET_RAW:
+		/* The setting is shared by every reader of this device */
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
 		if (copy_from_user(&raw, (void __user *)arg, sizeof(raw)))
 			return -EFAULT;
 		dev->raw_mode = !!raw;
 		return 0;
 
 	case INFNOISE_GET_ENTROPY:
-		mutex_lock(&dev->lock);
+		ret = mutex_lock_interruptible(&dev->lock);
+		if (ret)
+			return ret;
 		entropy = infnoise_health_get_entropy(&dev->health);
 		mutex_unlock(&dev->lock);
 		if (copy_to_user((void __user *)arg, &entropy, sizeof(entropy)))
@@ -881,18 +1075,25 @@ static int infnoise_probe(struct usb_interface *intf,
 		return ret;
 	}
 
+	/* Status bytes are parsed per 64-byte packet */
+	if (usb_endpoint_maxp(bulk_in) != FTDI_PACKET_SIZE) {
+		dev_err(&intf->dev, "Unexpected bulk IN packet size\n");
+		return -ENODEV;
+	}
+
 	/* Allocate device structure */
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
 
+	kref_init(&dev->kref);
 	dev->udev = usb_get_dev(udev);
-	dev->intf = intf;
+	dev->intf = usb_get_intf(intf);
 	dev->bulk_in_ep = bulk_in->bEndpointAddress;
 	dev->bulk_out_ep = bulk_out->bEndpointAddress;
 
 	mutex_init(&dev->lock);
-	init_completion(&dev->warmup_done);
+	init_waitqueue_head(&dev->warmup_wq);
 	INIT_WORK(&dev->warmup_work, infnoise_warmup_work);
 
 	/* Allocate buffers */
@@ -903,13 +1104,13 @@ static int infnoise_probe(struct usb_interface *intf,
 
 	if (!dev->clock_buf || !dev->usb_buf || !dev->read_buf || !dev->out_buf) {
 		ret = -ENOMEM;
-		goto err_buffers;
+		goto err_put;
 	}
 
 	/* Initialize health check */
 	ret = infnoise_health_init(&dev->health);
 	if (ret)
-		goto err_buffers;
+		goto err_put;
 
 	/* Initialize Keccak */
 	infnoise_keccak_init(&dev->keccak);
@@ -920,12 +1121,12 @@ static int infnoise_probe(struct usb_interface *intf,
 	/* Configure FTDI */
 	ret = infnoise_configure_ftdi(dev);
 	if (ret)
-		goto err_health;
+		goto err_put;
 
 	/* Test transfer to prime the device */
 	ret = infnoise_test_transfer(dev);
 	if (ret)
-		goto err_health;
+		goto err_put;
 
 	/* Mark device as present */
 	set_bit(INFNOISE_PRESENT, &dev->flags);
@@ -936,11 +1137,10 @@ static int infnoise_probe(struct usb_interface *intf,
 	ret = usb_register_dev(intf, &infnoise_class);
 	if (ret) {
 		dev_err(&intf->dev, "Could not register char device: %d\n", ret);
-		goto err_health;
+		usb_set_intfdata(intf, NULL);
+		goto err_put;
 	}
-	dev->minor = intf->minor;
-	dev_info(&intf->dev, "Registered /dev/infnoise%d\n",
-		 intf->minor - infnoise_class.minor_base);
+	dev_info(&intf->dev, "Registered /dev/%s\n", dev_name(intf->usb_dev));
 
 	/* Register hwrng */
 	ret = infnoise_hwrng_register(dev);
@@ -948,21 +1148,14 @@ static int infnoise_probe(struct usb_interface *intf,
 		dev_warn(&intf->dev, "hwrng registration failed, continuing\n");
 
 	/* Start warmup in workqueue */
-	schedule_work(&dev->warmup_work);
+	queue_work(system_long_wq, &dev->warmup_work);
 
 	dev_info(&intf->dev, "Infinite Noise TRNG initialized\n");
 
 	return 0;
 
-err_health:
-	infnoise_health_free(&dev->health);
-err_buffers:
-	kfree(dev->clock_buf);
-	kfree(dev->usb_buf);
-	kfree(dev->read_buf);
-	kfree(dev->out_buf);
-	usb_put_dev(dev->udev);
-	kfree(dev);
+err_put:
+	kref_put(&dev->kref, infnoise_delete);
 	return ret;
 }
 
@@ -975,11 +1168,17 @@ static void infnoise_disconnect(struct usb_interface *intf)
 
 	dev_info(&intf->dev, "Infinite Noise TRNG disconnected\n");
 
-	/* Mark device as absent */
+	/*
+	 * Mark device as absent. Taking the lock waits for a transfer in
+	 * progress, and later ones see the flag, so no USB I/O follows.
+	 */
+	mutex_lock(&dev->lock);
 	clear_bit(INFNOISE_PRESENT, &dev->flags);
+	clear_bit(INFNOISE_RESET_PENDING, &dev->flags);
+	mutex_unlock(&dev->lock);
 
-	/* Complete any waiting warmup */
-	complete_all(&dev->warmup_done);
+	/* Wake readers waiting for warmup */
+	wake_up_all(&dev->warmup_wq);
 
 	/* Cancel warmup work */
 	cancel_work_sync(&dev->warmup_work);
@@ -992,22 +1191,61 @@ static void infnoise_disconnect(struct usb_interface *intf)
 
 	usb_set_intfdata(intf, NULL);
 
-	/* Free resources */
-	infnoise_health_free(&dev->health);
-	kfree(dev->clock_buf);
-	kfree(dev->usb_buf);
-	kfree(dev->read_buf);
-	kfree(dev->out_buf);
-	usb_put_dev(dev->udev);
-	kfree(dev);
+	/* Open files can still hold the device */
+	kref_put(&dev->kref, infnoise_delete);
+}
+
+/*
+ * The hwrng stays registered across system sleep. Readers wait for the warmup
+ * that resume starts, and no USB I/O runs until then.
+ */
+static int infnoise_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct infnoise_device *dev = usb_get_intfdata(intf);
+
+	mutex_lock(&dev->lock);
+	set_bit(INFNOISE_SUSPENDED, &dev->flags);
+	mutex_unlock(&dev->lock);
+
+	cancel_work_sync(&dev->warmup_work);
+	clear_bit(INFNOISE_WARMUP_DONE, &dev->flags);
+
+	return 0;
+}
+
+/*
+ * The device can lose power during sleep, so configure it again in all cases.
+ */
+static int infnoise_resume(struct usb_interface *intf)
+{
+	struct infnoise_device *dev = usb_get_intfdata(intf);
+	int ret;
+
+	mutex_lock(&dev->lock);
+	clear_bit(INFNOISE_SUSPENDED, &dev->flags);
+
+	ret = infnoise_configure_ftdi(dev);
+	if (ret < 0) {
+		infnoise_queue_reset(dev);
+	} else {
+		clear_bit(INFNOISE_RESET_PENDING, &dev->flags);
+		dev->health_recoveries = 0;
+		infnoise_restart_warmup(dev);
+	}
+	mutex_unlock(&dev->lock);
+
+	return 0;
 }
 
 static struct usb_driver infnoise_driver = {
 	.name		= DRIVER_NAME,
 	.probe		= infnoise_probe,
 	.disconnect	= infnoise_disconnect,
+	.suspend	= infnoise_suspend,
+	.resume		= infnoise_resume,
+	.reset_resume	= infnoise_resume,
 	.id_table	= infnoise_table,
-	.supports_autosuspend = 0,  /* No suspend - device feeds entropy continuously */
+	.supports_autosuspend = 0,  /* No autosuspend - device feeds entropy continuously */
 };
 
 module_usb_driver(infnoise_driver);

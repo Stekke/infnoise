@@ -13,6 +13,10 @@
  * Build:  make test_infnoise
  * Run:    sudo ./test_infnoise   (or: make test)
  *
+ * --destructive unbinds and resets the device while it is open, and --suspend
+ * suspends the system with the device open.  Run these on a kernel with
+ * CONFIG_KASAN, because a lifetime bug can pass here and only appear in dmesg.
+ *
  * VID/PID note: the module matches 0x1209:0x3701 (pid.codes registered).
  * Stock Infinite Noise hardware ships as 0x0403:0x6015 (FTDI generic).
  * To test on unmodified hardware, temporarily change INFNOISE_VENDOR_ID
@@ -30,6 +34,9 @@
 #include <sys/wait.h>
 #include <stdint.h>
 #include <time.h>
+#include <glob.h>
+#include <dirent.h>
+#include <linux/usbdevice_fs.h>
 
 /* Must match kernel header exactly */
 struct infnoise_stats {
@@ -51,6 +58,9 @@ struct infnoise_stats {
 #define INFNOISE_GET_ENTROPY	_IOR(INFNOISE_IOC_MAGIC, 3, uint32_t)
 
 static int passed = 0, failed = 0, skipped = 0;
+static char dev_path[64];
+
+#define DRIVER_SYSFS "/sys/bus/usb/drivers/infnoise"
 
 #define TEST(name) printf("  %-50s ", name)
 #define PASS() do { printf("\033[32mPASS\033[0m\n"); passed++; } while(0)
@@ -109,7 +119,7 @@ static void test_hwrng_read(void)
 static void test_nonblock(void)
 {
 	TEST("O_NONBLOCK returns EAGAIN or data");
-	int fd = open("/dev/infnoise0", O_RDONLY | O_NONBLOCK);
+	int fd = open(dev_path, O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
 		FAIL(strerror(errno));
 		return;
@@ -154,7 +164,7 @@ static void test_interruptible(void)
 
 	if (pid == 0) {
 		signal(SIGUSR1, child_handler);
-		int fd = open("/dev/infnoise0", O_RDONLY);
+		int fd = open(dev_path, O_RDONLY);
 		if (fd < 0) _exit(2);
 
 		uint8_t buf[64];
@@ -322,7 +332,7 @@ static void test_open_close_reopen(void)
 	TEST("open/close/reopen 5 times");
 
 	for (int i = 0; i < 5; i++) {
-		int fd = open("/dev/infnoise0", O_RDONLY);
+		int fd = open(dev_path, O_RDONLY);
 		if (fd < 0) {
 			char msg[64];
 			snprintf(msg, sizeof(msg), "open %d: %s", i, strerror(errno));
@@ -343,18 +353,328 @@ static void test_open_close_reopen(void)
 	PASS();
 }
 
-/* ── Main ───────────────────────────────────────────────── */
+static int read_full(int fd, size_t len)
+{
+	uint8_t buf[256];
 
-int main(void)
+	while (len > 0) {
+		ssize_t n = read(fd, buf, len < sizeof(buf) ? len : sizeof(buf));
+
+		if (n <= 0)
+			return -1;
+		len -= n;
+	}
+	return 0;
+}
+
+static void test_concurrent_readers(void)
+{
+	pid_t pids[4];
+	int bad = 0;
+
+	TEST("4 concurrent readers each get 4096 bytes");
+
+	for (int i = 0; i < 4; i++) {
+		pids[i] = fork();
+		if (pids[i] < 0) {
+			FAIL(strerror(errno));
+			return;
+		}
+		if (pids[i] == 0) {
+			int fd = open(dev_path, O_RDONLY);
+
+			alarm(60);
+			_exit(fd < 0 || read_full(fd, 4096) < 0);
+		}
+	}
+
+	for (int i = 0; i < 4; i++) {
+		int status;
+
+		waitpid(pids[i], &status, 0);
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			bad++;
+	}
+
+	if (bad)
+		FAIL("a reader failed");
+	else
+		PASS();
+}
+
+/* SET_RAW is shared by all readers, so it must need privilege. */
+static void test_set_raw_needs_privilege(int fd)
+{
+	int status;
+	pid_t pid;
+
+	TEST("SET_RAW returns EPERM without privilege");
+
+	pid = fork();
+	if (pid < 0) {
+		FAIL(strerror(errno));
+		return;
+	}
+	if (pid == 0) {
+		int raw = 0;
+
+		if (setuid(65534) < 0)
+			_exit(2);
+		_exit(ioctl(fd, INFNOISE_SET_RAW, &raw) == -1 && errno == EPERM ? 0 : 1);
+	}
+
+	waitpid(pid, &status, 0);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+		PASS();
+	else
+		FAIL("unprivileged SET_RAW was not refused");
+}
+
+/* ── Destructive tests ──────────────────────────────────── */
+
+/* Find the bound interface, for example "1-2:1.0" */
+static int find_interface(char *name, size_t size)
+{
+	DIR *dir = opendir(DRIVER_SYSFS);
+	struct dirent *ent;
+	int ret = -1;
+
+	if (!dir)
+		return -1;
+	while ((ent = readdir(dir))) {
+		if (strchr(ent->d_name, ':')) {
+			snprintf(name, size, "%.*s", (int)size - 1, ent->d_name);
+			ret = 0;
+			break;
+		}
+	}
+	closedir(dir);
+	return ret;
+}
+
+static int write_file(const char *path, const char *value)
+{
+	int fd = open(path, O_WRONLY);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, value, strlen(value));
+	close(fd);
+	return n < 0 ? -1 : 0;
+}
+
+/* Wait for the node to come back, and for warmup to finish */
+static int wait_for_device(void)
+{
+	for (int i = 0; i < 100; i++) {
+		int fd = open(dev_path, O_RDONLY);
+
+		if (fd >= 0) {
+			int ret = read_full(fd, 64);
+
+			close(fd);
+			if (ret == 0)
+				return 0;
+		}
+		usleep(200000);
+	}
+	return -1;
+}
+
+/* A child blocks in read() on fd until the device goes away. */
+static pid_t start_reader(int fd)
+{
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		uint8_t buf[256];
+
+		alarm(30);
+		while (read(fd, buf, sizeof(buf)) > 0)
+			;
+		_exit(errno == ENODEV ? 0 : 1);
+	}
+	return pid;
+}
+
+/* Checks the open descriptor after the device is gone, then releases it. */
+static void finish_gone_device(int fd, pid_t reader)
+{
+	struct infnoise_stats stats;
+	uint8_t buf[64];
+	int status;
+	ssize_t n;
+
+	waitpid(reader, &status, 0);
+	n = read(fd, buf, sizeof(buf));
+	if (n != -1 || errno != ENODEV) {
+		FAIL("read on the old descriptor did not return ENODEV");
+	} else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		FAIL("blocked reader did not get ENODEV");
+	} else if (ioctl(fd, INFNOISE_GET_STATS, &stats) < 0) {
+		FAIL("GET_STATS on the old descriptor failed");
+	} else {
+		PASS();
+	}
+	close(fd);
+}
+
+static void test_unbind_while_open(void)
+{
+	char intf[64];
+	pid_t reader;
+	int fd;
+
+	TEST("unbind with an open descriptor and a blocked reader");
+
+	if (find_interface(intf, sizeof(intf)) < 0) {
+		FAIL("cannot find the interface in sysfs");
+		return;
+	}
+	fd = open(dev_path, O_RDONLY);
+	if (fd < 0) {
+		FAIL(strerror(errno));
+		return;
+	}
+	reader = start_reader(fd);
+	usleep(500000);
+
+	if (write_file(DRIVER_SYSFS "/unbind", intf) < 0) {
+		FAIL(strerror(errno));
+		kill(reader, SIGKILL);
+		waitpid(reader, NULL, 0);
+		close(fd);
+		return;
+	}
+	finish_gone_device(fd, reader);
+
+	TEST("device comes back after rebind");
+	if (write_file(DRIVER_SYSFS "/bind", intf) < 0 || wait_for_device() < 0)
+		FAIL("no data after rebind");
+	else
+		PASS();
+}
+
+static int read_sysfs_int(const char *intf, const char *attr)
+{
+	char path[128];
+	int value = 0;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/%s", intf, attr);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+	if (fscanf(f, "%d", &value) != 1)
+		value = 0;
+	fclose(f);
+	return value;
+}
+
+static void test_reset_while_open(void)
+{
+	char intf[64], node[64];
+	pid_t reader;
+	int fd, usb_fd;
+
+	TEST("USB reset with an open descriptor and a blocked reader");
+
+	if (find_interface(intf, sizeof(intf)) < 0) {
+		FAIL("cannot find the interface in sysfs");
+		return;
+	}
+	*strchr(intf, ':') = '\0';
+
+	snprintf(node, sizeof(node), "/dev/bus/usb/%03d/%03d",
+		 read_sysfs_int(intf, "busnum"), read_sysfs_int(intf, "devnum"));
+	usb_fd = open(node, O_WRONLY);
+	if (usb_fd < 0) {
+		SKIP(strerror(errno));
+		return;
+	}
+
+	fd = open(dev_path, O_RDONLY);
+	if (fd < 0) {
+		FAIL(strerror(errno));
+		close(usb_fd);
+		return;
+	}
+	reader = start_reader(fd);
+	usleep(500000);
+
+	if (ioctl(usb_fd, USBDEVFS_RESET) < 0) {
+		FAIL(strerror(errno));
+		kill(reader, SIGKILL);
+		waitpid(reader, NULL, 0);
+		close(fd);
+		close(usb_fd);
+		return;
+	}
+	close(usb_fd);
+	finish_gone_device(fd, reader);
+
+	TEST("device comes back after reset");
+	if (wait_for_device() < 0)
+		FAIL("no data after reset");
+	else
+		PASS();
+}
+
+static void test_suspend_while_open(void)
 {
 	int fd;
+
+	TEST("suspend for 10 s with an open descriptor");
+
+	fd = open(dev_path, O_RDONLY);
+	if (fd < 0) {
+		FAIL(strerror(errno));
+		return;
+	}
+	if (system("rtcwake -m mem -s 10 >/dev/null") != 0) {
+		SKIP("rtcwake failed");
+	} else if (read_full(fd, 64) < 0) {
+		FAIL(strerror(errno));
+	} else {
+		PASS();
+	}
+	close(fd);
+}
+
+/* ── Main ───────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+	int destructive = 0, suspend = 0;
+	glob_t devices;
+	int fd;
+
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--destructive")) {
+			destructive = 1;
+		} else if (!strcmp(argv[i], "--suspend")) {
+			suspend = 1;
+		} else {
+			fprintf(stderr, "Usage: %s [--destructive] [--suspend]\n", argv[0]);
+			return 2;
+		}
+	}
+
+	if (glob("/dev/infnoise*", 0, NULL, &devices) != 0) {
+		fprintf(stderr, "No /dev/infnoise* device found\n");
+		fprintf(stderr, "Is the module loaded? Try: sudo insmod infnoise.ko\n");
+		return 1;
+	}
+	snprintf(dev_path, sizeof(dev_path), "%s", devices.gl_pathv[0]);
+	globfree(&devices);
 
 	printf("\nInfinite Noise TRNG Kernel Module — Test Harness\n");
 	printf("=================================================\n\n");
 
-	fd = open("/dev/infnoise0", O_RDONLY);
+	fd = open(dev_path, O_RDONLY);
 	if (fd < 0) {
-		fprintf(stderr, "Cannot open /dev/infnoise0: %s\n", strerror(errno));
+		fprintf(stderr, "Cannot open %s: %s\n", dev_path, strerror(errno));
 		fprintf(stderr, "Is the module loaded? Try: sudo insmod infnoise.ko\n");
 		return 1;
 	}
@@ -373,12 +693,24 @@ int main(void)
 	test_padding_zeroed(fd);
 	test_ioctl_get_entropy(fd);
 	test_ioctl_set_raw(fd);
+	test_set_raw_needs_privilege(fd);
 	test_ioctl_bad_cmd(fd);
 
 	printf("\n--- Device lifecycle ---\n");
 	test_open_close_reopen();
+	test_concurrent_readers();
 
 	close(fd);
+
+	if (destructive) {
+		printf("\n--- Destructive ---\n");
+		test_unbind_while_open();
+		test_reset_while_open();
+	}
+	if (suspend) {
+		printf("\n--- Suspend ---\n");
+		test_suspend_while_open();
+	}
 
 	printf("\n=================================================\n");
 	printf("Results: %d passed, %d failed, %d skipped\n\n",

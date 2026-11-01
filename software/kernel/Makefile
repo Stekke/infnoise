@@ -16,8 +16,10 @@ PWD := $(shell pwd)
 obj-m := $(MODULE_NAME).o
 $(MODULE_NAME)-y := infnoise_main.o infnoise_health.o infnoise_keccak.o
 
-# Extra compiler flags
+# Extra compiler flags (build with INFNOISE_DEBUG=1 for dev_dbg() output)
+ifeq ($(INFNOISE_DEBUG),1)
 ccflags-y := -DDEBUG
+endif
 
 # Default target: build module
 all: modules
@@ -68,12 +70,13 @@ load: modules
 	insmod $(MODULE_NAME).ko
 
 # Load with debug
+load-debug: export INFNOISE_DEBUG := 1
 load-debug: modules
 	@if lsmod | grep -q "^$(MODULE_NAME)"; then \
 		echo "Module already loaded, unloading first..."; \
 		rmmod $(MODULE_NAME); \
 	fi
-	insmod $(MODULE_NAME).ko debug=1
+	insmod $(MODULE_NAME).ko debug=1 dyndbg=+p
 
 # Unload module
 unload:
@@ -127,18 +130,24 @@ test: test_infnoise
 	@echo ""
 	@echo "--- FIPS 140-2 (rngtest) ---"
 	@if command -v rngtest >/dev/null 2>&1 && dd if=/dev/hwrng bs=1 count=1 >/dev/null 2>&1; then \
-		dd if=/dev/hwrng bs=2500 count=100 2>/dev/null | rngtest; \
+		dd if=/dev/hwrng bs=2500 count=100 iflag=fullblock 2>/dev/null | rngtest; \
 	else \
 		echo "  SKIP (rngtest not installed or /dev/hwrng not readable)"; \
 	fi
 	@echo ""
 	@echo "--- Shannon entropy (ent) ---"
 	@if command -v ent >/dev/null 2>&1 && dd if=/dev/hwrng bs=1 count=1 >/dev/null 2>&1; then \
-		dd if=/dev/hwrng bs=2500 count=100 of=/tmp/infnoise-ent.bin 2>/dev/null && \
-		ent /tmp/infnoise-ent.bin && rm -f /tmp/infnoise-ent.bin; \
+		ENT_FILE=$$(mktemp) && \
+		dd if=/dev/hwrng bs=2500 count=100 iflag=fullblock of=$$ENT_FILE 2>/dev/null && \
+		ent $$ENT_FILE; \
+		rm -f $$ENT_FILE; \
 	else \
 		echo "  SKIP (ent not installed or /dev/hwrng not readable)"; \
 	fi
+
+# Run the tests that unbind and reset the device (use a debug kernel with KASAN)
+test-destructive: test_infnoise
+	./test_infnoise --destructive
 
 # Show help
 help:
@@ -158,13 +167,15 @@ help:
 	@echo "  dmesg        - Show recent kernel messages from module"
 	@echo "  info         - Show module information"
 	@echo "  test         - Run all tests: kmod + rngtest + ent (~45s)"
+	@echo "  test-destructive - Also unbind and reset the device while it is open"
 	@echo "  test-hwrng   - Dump hex from /dev/hwrng (visual check)"
 	@echo "  test-char    - Dump hex from /dev/infnoise0 (visual check)"
 	@echo ""
 	@echo "Variables:"
 	@echo "  KDIR         - Kernel source directory (default: /lib/modules/\$$(uname -r)/build)"
+	@echo "  INFNOISE_DEBUG=1 - Compile in dev_dbg() output"
 	@echo ""
 	@echo "Example:"
 	@echo "  make KDIR=/usr/src/linux-headers-6.1.0"
 
-.PHONY: all modules clean install uninstall load load-debug unload reload dmesg info test-hwrng test-char test help
+.PHONY: all modules clean install uninstall load load-debug unload reload dmesg info test-hwrng test-char test test-destructive help
