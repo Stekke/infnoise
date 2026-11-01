@@ -10,6 +10,7 @@
 // Structure for parsed command line options
 struct opt_struct {
         uint32_t outputMultiplier; // We output all the entropy when outputMultiplier == 0
+        uint32_t inputDivider;  // How many samples to absorb for each block of output
         uint32_t feedFreq; 	// poll-intervall to feed /dev/random
         bool daemon;            // Run as daemon?
         bool debug;             // Print debugging info?

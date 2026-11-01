@@ -127,6 +127,8 @@ Usage
         -r, --raw - do not whiten the output
         -m, --multiplier <value> - write 256 bits * value for each 512 bits written to
             the Keccak sponge.  Default of 0 means write all the entropy.
+        -x, --divider <value> - write 512 bits for each <value> times 512 bits written to
+            the Keccak sponge.  Default of 1 means no compression.
         -n, --no-output - do not write random output data
         -p, --pidfile <file> - write process ID to file
         -d, --daemon - run in the background
@@ -206,6 +208,17 @@ that cannot ever be detected using:
 This will take twice as long by default, but every 512 bits are tested to insure they are
 not more likely to occur than 1 in 2^433.  With --multiplier 1, only 256 bits are read
 from the sponge for each 512 put in.
+
+To compress even more, use --divider, or the INFNOISE_DIVIDER environment variable.  It
+absorbs the given number of 512 bit samples into the sponge, and only then reads one 512
+bit block from it:
+
+    $ infnoise --divider 4 > randbytes
+
+This reads 4 times as much from the device as it outputs.  Only samples that pass the
+checks are counted.  With --dev-random, the entropy credit of a block is the sum of its
+samples, at most 512 bits.  So a divider of 2 already gets the full credit, and higher
+values only add a margin.  A divider above 1 can't be used with a multiplier or --raw.
 
 For most cryptograpy applications, such as generating keys for RSA, we can count on the
 cryptographic strength of Keccack-1600 to produce cryptographically undetectably

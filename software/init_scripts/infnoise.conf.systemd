@@ -3,6 +3,10 @@
 #INFNOISE_MULTIPLIER=10
 # keccak multiplier, default = 2 with --dev-random, otherwise 0 (output all the entropy)
 
+#INFNOISE_DIVIDER=2
+# keccak divider: absorb this many 512 bit samples for each 512 bit block written, from 1 to 1024
+# default = 1 (no compression), can't be above 1 together with INFNOISE_MULTIPLIER
+
 #INFNOISE_SERIAL=DO0032ZA
 # serial number of device, default: ""
 # use infnoise --list-devices to find out your serial number

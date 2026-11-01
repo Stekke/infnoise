@@ -48,6 +48,20 @@ load 'test_helper/bats-assert/load'
   rm $TMP_FILE
 }
 
+@test "test whitened output (divider=2) for expected entropy" {
+  # capture some data
+  TMP_FILE=`mktemp -u $BATS_TMPDIR/infnoise-test-XXXXXXX`
+  timeout 5s ./infnoise --divider 2 > $TMP_FILE || true
+
+  # run ent
+  run ent $TMP_FILE
+
+  assert_line --index 0 --regexp '^Entropy = 7.99[0-9]+ bits per byte.$'
+
+  # cleanup
+  rm $TMP_FILE
+}
+
 @test "test --no-output --debug" {
   # capture some data
   TMP_FILE=`mktemp -u $BATS_TMPDIR/infnoise-test-XXXXXXX`

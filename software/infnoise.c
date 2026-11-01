@@ -24,6 +24,7 @@
 
 // The largest value that fits the 32-bit arithmetic on it
 #define MAX_MULTIPLIER (UINT32_MAX / 32u)
+#define MAX_DIVIDER 1024u
 #define MAX_FEED_FREQ ((uint32_t)(INT_MAX / 1000))
 
 // Tries to get the device working again.  They are forgotten once it has worked for a
@@ -53,6 +54,7 @@ static time_t monotonicSeconds(void) {
 
 static void initOpts(struct opt_struct *opts) {
     opts->outputMultiplier = 0u;
+    opts->inputDivider = 1u;
     opts->feedFreq = 30u;
     opts->forceReseed = false;
     opts->daemon = false;
@@ -77,6 +79,7 @@ static struct option longopts[] = {
         {"no-output",    no_argument,       NULL, 'n'},
         {"feed-frequency",    required_argument, NULL, 'f'},
         {"multiplier",   required_argument, NULL, 'm'},
+        {"divider",      required_argument, NULL, 'x'},
         {"pidfile",      required_argument, NULL, 'p'},
         {"serial",       required_argument, NULL, 's'},
         {"daemon",       no_argument,       NULL, 'd'},
@@ -155,11 +158,12 @@ int main(int argc, char **argv) {
     struct opt_struct opts;
     int ch;
     bool multiplierAssigned = false;
+    bool dividerAssigned = false;
 
     initOpts(&opts);
 
     // Process arguments
-    while ((ch = getopt_long(argc, argv, "rDRCnf:m:p:s:dlvh", longopts, NULL)) !=
+    while ((ch = getopt_long(argc, argv, "rDRCnf:m:x:p:s:dlvh", longopts, NULL)) !=
            -1) {
         switch (ch) {
             case 'r':
@@ -187,6 +191,13 @@ int main(int argc, char **argv) {
                 multiplierAssigned = true;
                 if (!parseNumber(optarg, 0u, MAX_MULTIPLIER, &opts.outputMultiplier)) {
                     fprintf(stderr, "Multiplier must be between 0 and %u\n", MAX_MULTIPLIER);
+                    return 1;
+                }
+                break;
+            case 'x':
+                dividerAssigned = true;
+                if (!parseNumber(optarg, 1u, MAX_DIVIDER, &opts.inputDivider)) {
+                    fprintf(stderr, "Divider must be between 1 and %u\n", MAX_DIVIDER);
                     return 1;
                 }
                 break;
@@ -232,6 +243,8 @@ int main(int argc, char **argv) {
               "    -r, --raw - do not whiten the output\n"
               "    -m, --multiplier <value> - write 256 bits * value for each 512 bits written to\n"
               "      the Keccak sponge.  Default of 0 means write all the entropy.\n"
+              "    -x, --divider <value> - write 512 bits for each <value> times 512 bits written to\n"
+              "      the Keccak sponge.  Default of 1 means no compression.\n"
               "    -f, --feed-frequency - feed interval for /dev/random, in seconds, 0 means no wait (default: 30)\n"
               "    -n, --no-output - do not write random output data\n"
               "    -p, --pidfile <file> - write process ID to file\n"
@@ -274,6 +287,24 @@ int main(int argc, char **argv) {
             }
             multiplierAssigned = true;
         }
+    }
+
+    if (!dividerAssigned) {
+        char *envDivider = getenv("INFNOISE_DIVIDER");
+        if (envDivider != NULL && envDivider[0] != '\0'
+            && !parseNumber(envDivider, 1u, MAX_DIVIDER, &opts.inputDivider)) {
+            fprintf(stderr, "Divider must be between 1 and %u\n", MAX_DIVIDER);
+            return 1;
+        }
+    }
+
+    if (opts.inputDivider > 1u && multiplierAssigned) {
+        fputs("Divider above 1 can't be used with a multiplier\n", stderr);
+        return 1;
+    }
+    if (opts.inputDivider > 1u && opts.raw) {
+        fputs("Divider above 1 can't be used with raw output\n", stderr);
+        return 1;
     }
 
     if (!multiplierAssigned && opts.devRandom) {
@@ -357,7 +388,9 @@ int main(int argc, char **argv) {
     time_t lastFailure = 0;
     while (running) {
         uint8_t result[resultSize];
-        uint64_t bytesWritten = readData(&context, result, opts.raw, opts.outputMultiplier);
+        uint64_t bytesWritten = opts.inputDivider > 1u
+                                ? readDataDivided(&context, result, opts.inputDivider)
+                                : readData(&context, result, opts.raw, opts.outputMultiplier);
 
         if (context.errorFlag) {
             bool recovered = false;

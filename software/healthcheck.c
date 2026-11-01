@@ -363,6 +363,7 @@ static inline bool computeRandBit(double *A, double K, double noiseAmplitude) {
 
 static void initOpts(struct opt_struct *opts) {
     opts->outputMultiplier = 0u;
+    opts->inputDivider = 1u;
     opts->daemon =
         opts->debug =
         opts->devRandom =

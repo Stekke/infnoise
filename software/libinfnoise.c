@@ -36,6 +36,10 @@ static bool healthFault = false;
 // Samples thrown away in a row
 static uint32_t rejectedSamples = 0u;
 
+// The samples absorbed so far for the next block of readDataDivided()
+static uint32_t gatheredBlocks;
+static uint32_t gatheredEntropy;
+
 // 0403:6015 is shared by every FT-X chip, so the USB description tells us it is an INM.
 // "FT240X" is what the EEPROM restore procedure in kernel/README.md writes.
 static const char *const knownDescriptions[] = {"Infinite Noise TRNG", "FT240X USB FIFO", "FT240X"};
@@ -106,6 +110,8 @@ bool initInfnoise(struct infnoise_context *context, char *serial, bool keccak, b
     context->entropyThisTime=0;
     context->errorFlag=false;
     context->keccakBytesGiven=0;
+    gatheredBlocks = 0u;
+    gatheredEntropy = 0u;
 
     if (infnoiseInUse) {
         context->message = "Only one Infinite Noise Multiplier can be used per process";
@@ -161,6 +167,9 @@ bool reinitInfnoise(struct infnoise_context *context) {
     context->errorFlag = false;
     healthFault = false;
     context->keccakBytesGiven = 0u;
+    // The sponge keeps what it absorbed, but none of that gets credited any more
+    gatheredBlocks = 0u;
+    gatheredEntropy = 0u;
     inmHealthCheckRestart();
 
     if (!openDevice(context) || !warmUp(context)) {
@@ -507,6 +516,15 @@ static uint32_t squeeze(uint8_t *result, uint32_t *bytesGiven) {
     return bytesToWrite;
 }
 
+//Use the lower of the measured entropy and the provable lower bound on
+//average entropy.
+static uint32_t limitEntropy(uint32_t entropy) {
+    if (entropy > inmExpectedEntropyPerBit * BUFLEN / INM_ACCURACY) {
+        return inmExpectedEntropyPerBit * BUFLEN / INM_ACCURACY;
+    }
+    return entropy;
+}
+
 // Clock out one batch of samples and read them back, retrying temporary USB errors.
 // The time reported is that of the attempt which worked.
 static bool transferSamples(struct infnoise_context *context, uint8_t *inBuf, double *microseconds) {
@@ -543,11 +561,7 @@ static bool transferSamples(struct infnoise_context *context, uint8_t *inBuf, do
 uint32_t processBytes(uint8_t *bytes, uint8_t *result, uint32_t *entropy,
                       uint32_t *bytesGiven,
                       bool raw, uint32_t outputMultiplier) {
-    //Use the lower of the measured entropy and the provable lower bound on
-    //average entropy.
-    if (*entropy > inmExpectedEntropyPerBit * BUFLEN / INM_ACCURACY) {
-        *entropy = inmExpectedEntropyPerBit * BUFLEN / INM_ACCURACY;
-    }
+    *entropy = limitEntropy(*entropy);
     if (raw) {
         // In raw mode, we just output raw data from the INM.
         if (result != NULL) {
@@ -582,31 +596,23 @@ uint32_t processBytes(uint8_t *bytes, uint8_t *result, uint32_t *entropy,
     return squeeze(result, bytesGiven);
 }
 
-uint32_t readData(struct infnoise_context *context, uint8_t *result, bool raw, uint32_t outputMultiplier) {
-    // check if data can be squeezed from the keccak sponge from previous state (or we need to collect some new entropy to get bytesGiven >0)
-    if (context->keccakBytesGiven != 0u) { // squeeze the sponge!
-        return squeeze(result, &context->keccakBytesGiven);
-    }
-
-    // collect new entropy (e.g. case RAW)
+// Read one sample from the device into bytes.  Return true if it passed the checks.
+static bool readSample(struct infnoise_context *context, uint8_t *bytes, uint32_t *entropy) {
     uint8_t inBuf[BUFLEN];
-    uint8_t bytes[BUFLEN / 8u];
     double microseconds;
-    uint32_t bytesWritten = 0u;
+    bool accepted = false;
     const char *rejection = NULL;
 
-    context->entropyThisTime = 0u;
     if (transferSamples(context, inBuf, &microseconds)) {
         if (microseconds > MAX_MICROSEC_FOR_SAMPLES) {
             rejection = "USB transfers from the Infinite Noise Multiplier are too slow";
         } else {
-            uint32_t entropy = extractBytes(bytes, sizeof(bytes), inBuf, &context->message, &context->errorFlag);
+            *entropy = extractBytes(bytes, BUFLEN / 8u, inBuf, &context->message, &context->errorFlag);
             if (context->errorFlag) {
                 healthFault = true;
-            } else if (inmHealthCheckOkToUseData() && inmEntropyOnTarget(entropy, BUFLEN)) {
+            } else if (inmHealthCheckOkToUseData() && inmEntropyOnTarget(*entropy, BUFLEN)) {
                 // called health check are ok and return bytes
-                context->entropyThisTime = entropy;
-                bytesWritten = processBytes(bytes, result, &context->entropyThisTime, &context->keccakBytesGiven, raw, outputMultiplier);
+                accepted = true;
                 rejectedSamples = 0u;
             } else {
                 rejection = "Entropy from the Infinite Noise Multiplier is out of range";
@@ -621,6 +627,51 @@ uint32_t readData(struct infnoise_context *context, uint8_t *result, bool raw, u
         context->errorFlag = true;
     }
     inmSecureZero(inBuf, sizeof(inBuf));
+    return accepted;
+}
+
+uint32_t readData(struct infnoise_context *context, uint8_t *result, bool raw, uint32_t outputMultiplier) {
+    // check if data can be squeezed from the keccak sponge from previous state (or we need to collect some new entropy to get bytesGiven >0)
+    if (context->keccakBytesGiven != 0u) { // squeeze the sponge!
+        return squeeze(result, &context->keccakBytesGiven);
+    }
+
+    // collect new entropy (e.g. case RAW)
+    uint8_t bytes[BUFLEN / 8u];
+    uint32_t entropy;
+    uint32_t bytesWritten = 0u;
+
+    context->entropyThisTime = 0u;
+    if (readSample(context, bytes, &entropy)) {
+        context->entropyThisTime = entropy;
+        bytesWritten = processBytes(bytes, result, &context->entropyThisTime, &context->keccakBytesGiven, raw, outputMultiplier);
+    }
+    inmSecureZero(bytes, sizeof(bytes));
+    return bytesWritten;
+}
+
+uint32_t readDataDivided(struct infnoise_context *context, uint8_t *result, uint32_t divider) {
+    uint8_t bytes[BUFLEN / 8u];
+    uint32_t entropy;
+    uint32_t bytesWritten = 0u;
+
+    context->entropyThisTime = 0u;
+    if (readSample(context, bytes, &entropy)) {
+        KeccakAbsorb(keccakState, bytes, BUFLEN / 64u);
+        gatheredBlocks++;
+        // A block can't hold more than BUFLEN bits of entropy, however much went in
+        gatheredEntropy += limitEntropy(entropy);
+        if (gatheredEntropy > BUFLEN) {
+            gatheredEntropy = BUFLEN;
+        }
+        if (gatheredBlocks >= divider) {
+            uint32_t bytesGiven = BUFLEN / 8u;
+            context->entropyThisTime = gatheredEntropy;
+            gatheredBlocks = 0u;
+            gatheredEntropy = 0u;
+            bytesWritten = squeeze(result, &bytesGiven);
+        }
+    }
     inmSecureZero(bytes, sizeof(bytes));
     return bytesWritten;
 }

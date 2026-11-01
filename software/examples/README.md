@@ -34,4 +34,8 @@ Under libinfnoise/examples you'll find two examples on how to integrate libinfno
     // (64 byte for normal operation or 128byte for multiplier mode)
     uint32_t readData(struct infnoise_context *context, uint8_t *result, bool raw, uint32_t outputMultiplier);
 
+    // Absorbs one sample, and outputs one 64 byte block for every "divider" samples.
+    // Returns 0 bytes while it gathers samples.
+    uint32_t readDataDivided(struct infnoise_context *context, uint8_t *result, uint32_t divider);
+
 The infnoise_context struct is also part of the interface. See [libinfnoise.h](../libinfnoise.h) for it's definition and the interface documentation.

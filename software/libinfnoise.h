@@ -108,6 +108,26 @@ void deinitInfnoise(struct infnoise_context *context);
 */
 uint32_t readData(struct infnoise_context *context, uint8_t *result, bool raw, uint32_t outputMultiplier);
 
+/*
+ * Reads one sample from the TRNG and absorbs it into the Keccak sponge.  When this makes
+ * divider samples, it squeezes one 64 byte block from the sponge into the "result" byte
+ * array.  This uses more data from the TRNG than it outputs.  Do not use this together
+ * with readData(), and initialize with keccak=true.
+ *
+ * This returns 0 bytes while it gathers samples.  Samples which don't pass the checks are
+ * not counted.  context->entropyThisTime has the entropy of a block after it is returned,
+ * which is at most 512 bits.  Check errorFlag as for readData().  After reinitInfnoise()
+ * the gathering starts again, and the entropy of the previous samples is not counted.
+ *
+ * parameters:
+ *  - context: infnoise_context struct with device pointer and state variables
+ *  - result: pointer to byte array of at least 64 bytes to store the result
+ *  - divider: how many samples to absorb for each block, starting from 1
+ *
+ * returns: number of bytes written to the byte-array
+*/
+uint32_t readDataDivided(struct infnoise_context *context, uint8_t *result, uint32_t divider);
+
 #ifdef __cplusplus
 }
 #endif
