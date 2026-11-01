@@ -7,11 +7,53 @@ After=dev-infnoise.device
 Type=forking
 WorkingDirectory=/tmp
 EnvironmentFile=-/etc/infnoise.conf
-ExecStart=/usr/local/sbin/infnoise --dev-random --daemon --pidfile /var/run/infnoise.pid
+ExecStart=/usr/local/sbin/infnoise --dev-random --daemon --pidfile /run/infnoise/infnoise.pid
+PIDFile=/run/infnoise/infnoise.pid
+RuntimeDirectory=infnoise
 User=root
 Group=root
 Restart=always
 RestartSec=5
+
+# Hardening.  It can't use these:
+# - PrivateDevices: libusb needs the device under /dev/bus/usb.
+# - PrivateUsers: the kernel only accepts CAP_SYS_ADMIN from the initial user namespace.
+# - ProcSubset=pid: it reads /proc/sys/kernel/random.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+DeviceAllow=/dev/infnoise rw
+DevicePolicy=closed
+IPAddressDeny=any
+KeyringMode=private
+# A core dump would contain the Keccak state
+LimitCORE=0
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+MemoryMax=64M
+NoNewPrivileges=yes
+PrivateIPC=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RemoveIPC=yes
+# libusb watches for USB devices over netlink
+RestrictAddressFamilies=AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+TasksMax=8
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
